@@ -1,5 +1,6 @@
 #include "app.h"
 #include "ini.h"
+#include <windef.h>
 
 #define IMGUI_DEFINE_MATH_OPERATORS
 #include "imgui.h"
@@ -405,7 +406,7 @@ namespace simple_notepad
         }
         case WM_NCRBUTTONUP: {
             // right-clicking the title opens our menu; the rest of the caption keeps the system menu
-            POINT p{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+            POINT p{.x = GET_X_LPARAM(lparam), .y = GET_Y_LPARAM(lparam)};
             ScreenToClient(hwnd_, &p);
             if (wparam == HTCAPTION && PtInRect(&title_, p) != FALSE)
             {
