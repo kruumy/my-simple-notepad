@@ -2,9 +2,7 @@
 
 #include "editor.h"
 #include "text_file.h"
-
 #include <windows.h>
-
 #include <d3d11.h>
 #include <dxgi1_3.h>
 #include <filesystem>
@@ -48,13 +46,12 @@ namespace simple_notepad
         Microsoft::WRL::ComPtr<ID3D11DeviceContext> context_;
         Microsoft::WRL::ComPtr<IDXGISwapChain> swap_chain_;
         HANDLE frame_ready_ = nullptr; // signalled when the gpu can take another frame
-        std::vector<char> presented_; // draw data of the frame on screen, to skip identical frames
+        std::vector<char> presented_;  // draw data of the frame on screen, to skip identical frames
         Microsoft::WRL::ComPtr<ID3D11RenderTargetView> target_;
         bool running_ = true;
         bool focused_ = true;
         bool in_frame_ = false;
-        int frames_ = 3;
-        float dpi_scale_ = 1.0f;
+        int frames_ = 3;        float dpi_scale_ = 1.0f;
 
         // document
         text_file doc_;

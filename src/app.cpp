@@ -25,6 +25,8 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT msg
 namespace simple_notepad
 {
     constexpr float BASE_FONT_SIZE = 16.0f;
+    constexpr float MENU_FONT_SIZE = 17.0f;
+    constexpr float MENU_PADDING_Y = 11.0f;
     constexpr float EDITOR_FONT_SIZE = 17.0f;
     constexpr float MIN_ZOOM = 0.5f;
     constexpr float MAX_ZOOM = 4.0f;
@@ -33,8 +35,8 @@ namespace simple_notepad
     constexpr double TOAST_SECONDS = 2.2;
     constexpr double MODAL_FADE_SECONDS = 0.14;
     constexpr std::uintmax_t MAX_FILE_BYTES = static_cast<const std::uintmax_t>(1024 * 1024);
-    constexpr ImVec4 CLEAR_COLOR{0.075f, 0.078f, 0.090f, 1.0f};
-    constexpr COLORREF WINDOW_BRUSH = RGB(19, 20, 23);
+    constexpr ImVec4 CLEAR_COLOR{0.122f, 0.122f, 0.122f, 1.0f};
+    constexpr COLORREF WINDOW_BRUSH = RGB(31, 31, 31);
 
     static float ease_out(float t)
     {
@@ -81,20 +83,20 @@ namespace simple_notepad
         style.FrameBorderSize = 0;
         style.SelectableTextAlign = {0.0f, 0.5f};
 
-        const ImVec4 bg{0.075f, 0.078f, 0.090f, 1.0f};
-        const ImVec4 panel{0.105f, 0.110f, 0.125f, 1.0f};
-        const ImVec4 raised{0.150f, 0.157f, 0.180f, 1.0f};
-        const ImVec4 hover{0.200f, 0.208f, 0.240f, 1.0f};
-        const ImVec4 accent{0.380f, 0.560f, 1.000f, 1.0f};
-        const ImVec4 text{0.890f, 0.900f, 0.920f, 1.0f};
+        const ImVec4 bg{0.122f, 0.122f, 0.122f, 1.0f}; // vs code dark modern;
+        const ImVec4 panel{0.094f, 0.094f, 0.094f, 1.0f};
+        const ImVec4 raised{0.192f, 0.192f, 0.192f, 1.0f};
+        const ImVec4 hover{0.165f, 0.176f, 0.180f, 1.0f};
+        const ImVec4 accent{0.000f, 0.471f, 0.831f, 1.0f};
+        const ImVec4 text{0.800f, 0.800f, 0.800f, 1.0f};
 
         ImVec4* c = style.Colors;
         c[ImGuiCol_Text] = text;
-        c[ImGuiCol_TextDisabled] = {0.50f, 0.52f, 0.57f, 1.0f};
+        c[ImGuiCol_TextDisabled] = {0.431f, 0.463f, 0.506f, 1.0f};
         c[ImGuiCol_WindowBg] = bg;
         c[ImGuiCol_ChildBg] = {0, 0, 0, 0};
-        c[ImGuiCol_PopupBg] = {0.120f, 0.125f, 0.142f, 0.98f};
-        c[ImGuiCol_Border] = {1, 1, 1, 0.07f};
+        c[ImGuiCol_PopupBg] = {0.122f, 0.122f, 0.122f, 1.0f};
+        c[ImGuiCol_Border] = {0.169f, 0.169f, 0.169f, 1.0f};
         c[ImGuiCol_FrameBg] = raised;
         c[ImGuiCol_FrameBgHovered] = hover;
         c[ImGuiCol_FrameBgActive] = hover;
@@ -110,9 +112,9 @@ namespace simple_notepad
         c[ImGuiCol_Header] = {accent.x, accent.y, accent.z, 0.22f};
         c[ImGuiCol_HeaderHovered] = {accent.x, accent.y, accent.z, 0.30f};
         c[ImGuiCol_HeaderActive] = {accent.x, accent.y, accent.z, 0.40f};
-        c[ImGuiCol_Separator] = {1, 1, 1, 0.06f};
-        c[ImGuiCol_TextSelectedBg] = {accent.x, accent.y, accent.z, 0.35f};
-        c[ImGuiCol_InputTextCursor] = accent;
+        c[ImGuiCol_Separator] = {0.169f, 0.169f, 0.169f, 1.0f};
+        c[ImGuiCol_TextSelectedBg] = {0.149f, 0.310f, 0.471f, 1.0f};
+        c[ImGuiCol_InputTextCursor] = {0.682f, 0.686f, 0.678f, 1.0f};
         c[ImGuiCol_ModalWindowDimBg] = {0, 0, 0, 0.45f};
         c[ImGuiCol_NavCursor] = {0, 0, 0, 0};
     }
@@ -471,11 +473,15 @@ namespace simple_notepad
         ImGui::SetNextWindowSize(viewport->Size);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0, 0});
+        // imgui sizes the menu bar from the font and padding active at Begin
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10, MENU_PADDING_Y) * dpi_scale_);
+        ImGui::PushFont(nullptr, MENU_FONT_SIZE);
         constexpr ImGuiWindowFlags root_flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
                                                 ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_MenuBar |
                                                 ImGuiWindowFlags_NoBringToFrontOnFocus;
         ImGui::Begin("##root", nullptr, root_flags);
-        ImGui::PopStyleVar(2);
+        ImGui::PopFont();
+        ImGui::PopStyleVar(3);
 
         draw_menu();
         draw_find_bar();
@@ -623,7 +629,8 @@ namespace simple_notepad
 
     void app::draw_menu()
     {
-        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10, 11) * dpi_scale_);
+        ImGui::PushFont(nullptr, MENU_FONT_SIZE);
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10, MENU_PADDING_Y) * dpi_scale_);
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8, 8) * dpi_scale_);
         if (ImGui::BeginMenuBar())
         {
@@ -697,6 +704,7 @@ namespace simple_notepad
             ImGui::EndMenuBar();
         }
         ImGui::PopStyleVar(2);
+        ImGui::PopFont();
     }
 
     // the menu bar doubles as the title bar: title, drag area and window buttons
@@ -908,6 +916,11 @@ namespace simple_notepad
         ImGui::PushStyleColor(ImGuiCol_Button, {0, 0, 0, 0});
         ImGui::BeginChild("##status", {0, 0}, ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NoScrollbar);
         ImGui::SetCursorPosY((ImGui::GetWindowHeight() - ImGui::GetFrameHeight()) * 0.5f);
+
+        ImGui::AlignTextToFramePadding();
+        const ImGuiIO& io = ImGui::GetIO();
+        ImGui::TextDisabled("%.0f fps  dt %.2f ms", io.Framerate, io.DeltaTime * 1000.0f);
+        ImGui::SameLine(0, style.ItemSpacing.x * 2);
 
         const double since = ImGui::GetTime() - toast_time_;
         if (since < TOAST_SECONDS)
