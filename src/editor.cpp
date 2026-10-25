@@ -7,17 +7,21 @@
 #include <cctype>
 #include <cmath>
 #include <format>
+#include <numbers>
 
 namespace simple_notepad
 {
     constexpr float PAD = 12.0f;
     constexpr float LINE_SPACING = 1.35f;
-    constexpr float MINIMAP_WIDTH = 110.0f;
+    constexpr float MINIMAP_MIN_WIDTH = 40.0f;
+    constexpr float MINIMAP_MIN_TEXT_WIDTH = 120.0f; // room the text keeps when the minimap is dragged wide
+    constexpr float MINIMAP_GRIP = 5.0f;
     constexpr float MINIMAP_MIN_EDITOR_WIDTH = 520.0f;
     constexpr float MINIMAP_ROW = 2.0f;
     constexpr float MINIMAP_CHAR = 1.1f;
     constexpr float SCROLL_SPEED = 22.0f;
     constexpr float CARET_SPEED = 38.0f;
+    constexpr float TEARDROP_SPEED = 14.0f;
     constexpr double BLINK_HALF_PERIOD = 0.5;
     constexpr double MERGE_SECONDS = 1.0;
     constexpr size_t MAX_UNDO = 1000;
@@ -116,7 +120,8 @@ namespace simple_notepad
 
     bool editor::animating() const
     {
-        return !caret_settled_ || !fades_.empty() || scroll_x_ != target_x_ || scroll_y_ != target_y_;
+        return !caret_settled_ || !fades_.empty() || scroll_x_ != target_x_ || scroll_y_ != target_y_ ||
+               (teardrop_ != 0.0f && teardrop_ != 1.0f);
     }
 
     double editor::seconds_until_blink() const
@@ -764,6 +769,50 @@ namespace simple_notepad
         dpi_ = v.dpi;
         ImGui::PushFont(v.font, v.font_size);
         const float font_size = ImGui::GetFontSize();
+
+        // zooming keeps the point under the mouse, or else the caret, at the same spot in the view.
+        // measured with the old layout before it is rebuilt, then restored after
+        int anchor = -1;
+        float anchor_x = 0.0f; // view-space position the anchor should stay at
+        float anchor_y = 0.0f;
+        float anchor_frac = 0.0f; // how far down its row the mouse was
+        // unwrapped rows don't reflow, so the exact point scales instead, even over empty space
+        bool point_anchor = false;
+        float anchor_row = 0.0f;
+        float anchor_text_x = 0.0f;
+        const float old_space = ascii_advance_[' '];
+        if (layout_size_ > 0.0f && layout_size_ != font_size)
+        {
+            const float old_pad = PAD * dpi_;
+            const bool over_text = io.MousePos.x >= view_left_ && io.MousePos.x < view_left_ + view_width_ &&
+                                   io.MousePos.y >= top_ && io.MousePos.y < top_ + view_height_;
+            if (over_text)
+            {
+                anchor_x = io.MousePos.x - view_left_;
+                anchor_y = io.MousePos.y - top_;
+                const float row_f = (anchor_y + scroll_y_ - old_pad) / line_height_;
+                if (v.wrap)
+                {
+                    const int r =
+                        std::clamp(static_cast<int>(std::floor(row_f)), 0, static_cast<int>(rows_.size()) - 1);
+                    anchor = pos_at(r, anchor_x + scroll_x_ - old_pad);
+                    anchor_frac = std::clamp(row_f - static_cast<float>(r), 0.0f, 1.0f);
+                }
+                else
+                {
+                    point_anchor = true;
+                    anchor_row = row_f;
+                    anchor_text_x = anchor_x + scroll_x_ - old_pad;
+                }
+            }
+            else
+            {
+                anchor = caret_;
+                anchor_x = x_of(caret_) + old_pad - scroll_x_;
+                anchor_y = (static_cast<float>(row_of(caret_)) * line_height_) + old_pad - scroll_y_;
+            }
+        }
+
         line_height_ = std::round(font_size * LINE_SPACING);
         if (ImFontBaked* baked = ImGui::GetFontBaked(); baked != baked_ || layout_size_ != font_size)
         {
@@ -785,15 +834,52 @@ namespace simple_notepad
 
         const int digits = std::max(3, static_cast<int>(std::to_string(line_count_).size()));
         const float gutter_width = (static_cast<float>(digits) * ascii_advance_['0']) + (pad * 2.0f);
-        const float minimap_width =
-            v.minimap && total_width > MINIMAP_MIN_EDITOR_WIDTH * dpi_ ? MINIMAP_WIDTH * dpi_ : 0.0f;
-        const float text_width = total_width - gutter_width - minimap_width;
         const float scrollbar = ImGui::GetStyle().ScrollbarSize;
+        const float minimap_scale = MINIMAP_CHAR * dpi_ / ascii_advance_[' '];
+        const float minimap_margin = 8.0f * dpi_;
+        float minimap_width = 0.0f;
+        if (v.minimap && total_width > MINIMAP_MIN_EDITOR_WIDTH * dpi_)
+        {
+            if (v.wrap)
+            {
+                // sized to hold a full wrapped row, which itself depends on the minimap's width:
+                // m = (total - gutter - padding - m) * scale + margin, solved for m
+                const float avail = total_width - gutter_width - (pad * 2.0f) - scrollbar;
+                minimap_width = ((avail * minimap_scale) + minimap_margin) / (1.0f + minimap_scale);
+            }
+            else
+            {
+                // dragging stops at the widest line, so the minimap never grows past what it can show
+                const float fit = (content_width_ * minimap_scale) + minimap_margin;
+                minimap_width =
+                    std::clamp(minimap_width_ * dpi_, MINIMAP_MIN_WIDTH * dpi_,
+                               std::max(MINIMAP_MIN_WIDTH * dpi_,
+                                        std::min(std::max(fit, MINIMAP_WIDTH * dpi_),
+                                                 total_width - gutter_width - (MINIMAP_MIN_TEXT_WIDTH * dpi_))));
+            }
+        }
+        const float text_width = total_width - gutter_width - minimap_width;
         const float wrap_width =
             v.wrap ? std::max(text_width - (pad * 2.0f) - scrollbar, ascii_advance_['M'] * 8.0f) : -1.0f;
         if (layout_dirty_ || wrap_width != layout_wrap_width_)
         {
             rebuild_layout(wrap_width);
+        }
+        if (point_anchor)
+        {
+            snap_caret_ = true; // its animated position is in old-zoom pixels
+            scroll_y_ = target_y_ = (anchor_row * line_height_) + pad - anchor_y;
+            scroll_x_ = target_x_ = (anchor_text_x * ascii_advance_[' '] / old_space) + pad - anchor_x;
+        }
+        else if (anchor >= 0)
+        {
+            snap_caret_ = true; // its animated position is in old-zoom pixels
+            const float row_y = static_cast<float>(row_of(anchor)) + anchor_frac;
+            scroll_y_ = target_y_ = (row_y * line_height_) + pad - anchor_y;
+            if (!v.wrap)
+            {
+                scroll_x_ = target_x_ = x_of(anchor) + pad - anchor_x;
+            }
         }
 
         // allow scrolling half a page past the end, like most code editors
@@ -826,6 +912,7 @@ namespace simple_notepad
             focus_request_ = false;
         }
         focused_ = ImGui::IsWindowFocused();
+        view_left_ = window->Pos.x;
         view_width_ = window->InnerRect.GetWidth();
         view_height_ = window->InnerRect.GetHeight();
 
@@ -848,6 +935,15 @@ namespace simple_notepad
             const float wheel_y = io.KeyShift ? 0.0f : io.MouseWheel;
             target_x_ -= wheel_x * ascii_advance_[' '] * 8.0f;
             target_y_ -= wheel_y * line_height_ * 3.0f;
+        }
+        // middle drag pans; the view follows the hand directly instead of easing
+        panning_ = ImGui::IsMouseDown(ImGuiMouseButton_Middle) &&
+                   (panning_ || (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Middle)));
+        if (panning_)
+        {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
+            scroll_x_ = target_x_ -= io.MouseDelta.x;
+            scroll_y_ = target_y_ -= io.MouseDelta.y;
         }
         handle_mouse(origin_x, origin_y, hovered);
         if (focused_ && !just_focused)
@@ -882,6 +978,10 @@ namespace simple_notepad
         if (minimap_width > 0.0f)
         {
             draw_minimap(p0.x + gutter_width + text_width, minimap_width);
+        }
+        else
+        {
+            teardrop_ = 0.0f; // a fade left half-done would keep animating() true and the app awake
         }
         ImGui::SetCursorScreenPos(p0);
         ImGui::Dummy({total_width, v.height});
@@ -1049,8 +1149,56 @@ namespace simple_notepad
         const float scroll_max = std::max(1.0f, (static_cast<float>(rows_.size()) * line_height_) +
                                                     (PAD * 2.0f * dpi_) + (height_ * 0.5f) - view_height_);
         // when the whole minimap doesn't fit it scrolls in proportion to the editor
+        // whole pixels: blocks under a pixel tall would flicker between one and two rows as it scrolls
         const float offset =
-            total > height_ ? std::clamp(scroll_y_ / scroll_max, 0.0f, 1.0f) * (total - height_) : 0.0f;
+            total > height_ ? std::round(std::clamp(scroll_y_ / scroll_max, 0.0f, 1.0f) * (total - height_)) : 0.0f;
+        const float block_h = std::max(1.0f, std::round(row_h * 0.7f));
+        const float view_top = top_ + (scroll_y_ / line_height_ * row_h) - offset;
+        const float view_h = view_height_ / line_height_ * row_h;
+
+        // off-frame teardrop, sized by last frame's animation so it can be grabbed before the minimap
+        const float drop_r = 4.5f * dpi_ * teardrop_;
+        // slides in from the edge while it grows
+        const ImVec2 drop_tip{x + width - (2.0f * dpi_) + ((1.0f - teardrop_) * 6.0f * dpi_),
+                              view_top + (std::min(view_h, height_) * 0.5f)};
+        const ImVec2 drop_c{drop_tip.x - (drop_r * 2.2f), drop_tip.y};
+        bool drop_held = false;
+        if (teardrop_ > 0.0f)
+        {
+            // dragging it scrolls vertically like a scrollbar thumb: the view's centre follows the pointer
+            ImGui::SetCursorScreenPos({drop_c.x - drop_r, drop_c.y - drop_r - (2.0f * dpi_)});
+            ImGui::InvisibleButton("##teardrop", {drop_tip.x - drop_c.x + drop_r, (drop_r + (2.0f * dpi_)) * 2.0f});
+            drop_held = ImGui::IsItemActive();
+            if (drop_held)
+            {
+                target_y_ = ((io.MousePos.y - top_ + offset) / row_h * line_height_) - (view_height_ * 0.5f);
+            }
+            if (ImGui::IsItemDeactivated())
+            {
+                focus_request_ = true;
+            }
+        }
+
+        // submitted first so it wins the hover over the minimap button it overlaps; wrapping sizes the
+        // minimap itself, so only unwrapped text can be resized
+        if (layout_wrap_width_ < 0.0f)
+        {
+            ImGui::SetCursorScreenPos({x, top_});
+            ImGui::InvisibleButton("##minimap_grip", {MINIMAP_GRIP * dpi_, height_});
+            if (ImGui::IsItemHovered() || ImGui::IsItemActive())
+            {
+                ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+            }
+            if (ImGui::IsItemActive())
+            {
+                // from the mouse, not its delta, so the edge stays under the pointer after hitting a limit
+                minimap_width_ = (x + width - io.MousePos.x) / dpi_;
+            }
+            if (ImGui::IsItemDeactivated())
+            {
+                minimap_width_ = width / dpi_; // keep the clamped width, not wherever the drag overshot
+            }
+        }
 
         ImGui::SetCursorScreenPos({x, top_});
         ImGui::InvisibleButton("##minimap", {width, height_});
@@ -1058,6 +1206,8 @@ namespace simple_notepad
         if (ImGui::IsItemActive())
         {
             target_y_ = ((io.MousePos.y - top_ + offset) / row_h * line_height_) - (view_height_ * 0.5f);
+            // inverse of the text blocks' mapping below; clamped to the content later, and to 0 when wrapping
+            target_x_ = ((io.MousePos.x - x - (6.0f * dpi_)) / scale) + (PAD * dpi_) - (view_width_ * 0.5f);
         }
         if (ImGui::IsItemDeactivated())
         {
@@ -1080,7 +1230,7 @@ namespace simple_notepad
         for (int r = first; r <= last; ++r) // raw loop: visible rows by index
         {
             const row& w = rows_[r];
-            const float y = top_ + (static_cast<float>(r) * row_h) - offset;
+            const float y = std::round(top_ + (static_cast<float>(r) * row_h) - offset);
             float cx = 0.0f;
             float run = -1.0f;
             // raw loop: merges each word into one block, like a zoomed-out view of the text
@@ -1095,7 +1245,7 @@ namespace simple_notepad
                 const bool blank = c == ' ' || c == '\t';
                 if (blank && run >= 0.0f)
                 {
-                    dl->AddRectFilled({left + (run * scale), y}, {left + (cx * scale), y + (row_h * 0.7f)}, ink);
+                    dl->AddRectFilled({left + (run * scale), y}, {left + (cx * scale), y + block_h}, ink);
                     run = -1.0f;
                 }
                 else if (!blank && run < 0.0f)
@@ -1107,14 +1257,40 @@ namespace simple_notepad
             }
             if (run >= 0.0f)
             {
-                dl->AddRectFilled({left + (run * scale), y}, {left + (std::min(cx, max_x) * scale), y + (row_h * 0.7f)},
-                                  ink);
+                dl->AddRectFilled({left + (run * scale), y}, {left + (std::min(cx, max_x) * scale), y + block_h}, ink);
             }
         }
-        const float view_top = top_ + (scroll_y_ / line_height_ * row_h) - offset;
-        const float view_h = view_height_ / line_height_ * row_h;
-        dl->AddRectFilled({x + 1.0f, view_top}, {x + width, view_top + view_h},
+        // spans the full width unless the text is wider than the view
+        const float pad = PAD * dpi_;
+        float view_left = x + 1.0f;
+        float view_right = x + width;
+        if (content_width_ + (pad * 2.0f) > view_width_)
+        {
+            view_left = std::max(view_left, left + ((scroll_x_ - pad) * scale));
+            view_right = left + ((scroll_x_ + view_width_ - pad) * scale);
+        }
+        dl->AddRectFilled({view_left, view_top}, {view_right, view_top + view_h},
                           IM_COL32(255, 255, 255, hovered || ImGui::IsItemActive() ? 26 : 14));
+        dl->AddRect({view_left, view_top}, {view_right, view_top + view_h}, IM_COL32(255, 255, 255, 40), 0.0f,
+                    ImDrawFlags_None, dpi_);
+        // the view is almost entirely past the minimap's right edge (long lines): a teardrop points toward it
+        const bool off_frame = x + width - view_left < (view_right - view_left) * 0.01f;
+        // approach snaps within 0.5, so ease in percent
+        teardrop_ = approach(teardrop_ * 100.0f, off_frame ? 100.0f : 0.0f, TEARDROP_SPEED) / 100.0f;
+        // held, it stays up even if the view comes back on screen mid-drag
+        teardrop_ = drop_held ? 1.0f : teardrop_;
+        if (teardrop_ > 0.0f)
+        {
+            const float r = 4.5f * dpi_ * teardrop_;
+            const ImVec2 tip{x + width - (2.0f * dpi_) + ((1.0f - teardrop_) * 6.0f * dpi_), drop_tip.y};
+            const ImVec2 c{tip.x - (r * 2.2f), tip.y};
+            // one outline (the far side of the circle, then out to the tip along its tangents) so no
+            // overlapping shapes show through when it fades
+            const float tangent = std::acos(1.0f / 2.2f);
+            dl->PathArcTo(c, r, tangent, (2.0f * std::numbers::pi_v<float>)-tangent);
+            dl->PathLineTo(tip);
+            dl->PathFillConvex(ImGui::GetColorU32(ImGuiCol_Text, teardrop_));
+        }
         dl->PopClipRect();
     }
 } // namespace simple_notepad

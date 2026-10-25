@@ -11,6 +11,7 @@ add_executable(${PROJECT_NAME} WIN32
     "src/main.cpp"
     "src/app.cpp"
     "src/editor.cpp"
+    "src/ini.cpp"
     "src/text_file.cpp"
 )
 target_include_directories(${PROJECT_NAME} PRIVATE src)

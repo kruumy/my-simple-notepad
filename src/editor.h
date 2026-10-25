@@ -127,6 +127,10 @@ namespace simple_notepad
         float top_ = 0.0f;
         float height_ = 0.0f;
         bool dragging_ = false;
+        bool panning_ = false;
+        float teardrop_ = 0.0f; // minimap off-frame marker, 0 hidden to 1 shown
+        static constexpr float MINIMAP_WIDTH = 110.0f;
+        float minimap_width_ = MINIMAP_WIDTH; // unscaled, dragged by its left edge
         bool snap_caret_ = true;
         bool focused_ = false;
         bool focus_request_ = true;
@@ -137,6 +141,7 @@ namespace simple_notepad
         float target_y_ = 0.0f;
         float scroll_max_x_ = 0.0f;
         float scroll_max_y_ = 0.0f;
+        float view_left_ = 0.0f; // screen x of the text view
         float view_width_ = 0.0f;
         float view_height_ = 0.0f;
         float caret_x_ = 0.0f; // animated, content space

@@ -1,4 +1,5 @@
 #include "app.h"
+#include "ini.h"
 
 #define IMGUI_DEFINE_MATH_OPERATORS
 #include "imgui.h"
@@ -16,7 +17,6 @@
 #include <cstring>
 #include <dwmapi.h>
 #include <format>
-#include <fstream>
 #include <shellapi.h>
 #include <windowsx.h>
 
@@ -137,12 +137,8 @@ namespace simple_notepad
         };
         RegisterClassExW(&wc);
 
-        const RECT& r = settings_.window;
-        const bool has_rect = r.right > r.left && MonitorFromRect(&r, MONITOR_DEFAULTTONULL) != nullptr;
         hwnd_ = CreateWindowExW(WS_EX_ACCEPTFILES, wc.lpszClassName, L"Simple Notepad", WS_OVERLAPPEDWINDOW,
-                                has_rect ? r.left : CW_USEDEFAULT, has_rect ? r.top : CW_USEDEFAULT,
-                                has_rect ? r.right - r.left : 960, has_rect ? r.bottom - r.top : 640, nullptr, nullptr,
-                                wc.hInstance, this);
+                                CW_USEDEFAULT, CW_USEDEFAULT, 960, 640, nullptr, nullptr, wc.hInstance, this);
         if (hwnd_ == nullptr || !create_device())
         {
             MessageBoxW(nullptr, L"Could not create a Direct3D 11 device.", L"Simple Notepad", MB_ICONERROR);
@@ -185,11 +181,14 @@ namespace simple_notepad
 
         if (!open_path.empty())
         {
-            open(open_path);
+            // a relative argument would otherwise follow the working directory, which the file dialogs change
+            std::error_code ec;
+            const std::filesystem::path full = std::filesystem::absolute(open_path, ec);
+            open(ec ? std::filesystem::path(open_path) : full);
         }
         update_title();
         ready_ = true;
-        ShowWindow(hwnd_, settings_.maximized ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL);
+        ShowWindow(hwnd_, SW_SHOWNORMAL);
 
         // event-driven loop: sleeps until input arrives, renders only while something changes
         while (running_)
@@ -403,6 +402,17 @@ namespace simple_notepad
         case WM_NCHITTEST: {
             const LRESULT hit = DefWindowProcW(hwnd_, msg, wparam, lparam);
             return hit == HTCLIENT ? hit_test(lparam) : hit;
+        }
+        case WM_NCRBUTTONUP: {
+            // right-clicking the title opens our menu; the rest of the caption keeps the system menu
+            POINT p{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+            ScreenToClient(hwnd_, &p);
+            if (wparam == HTCAPTION && PtInRect(&title_, p) != FALSE)
+            {
+                title_menu_ = true;
+                return 0;
+            }
+            break;
         }
         case WM_ACTIVATE:
             focused_ = LOWORD(wparam) != WA_INACTIVE;
@@ -721,10 +731,29 @@ namespace simple_notepad
         const ImVec2 title_size = ImGui::CalcTextSize(title_utf8_.c_str());
         const float title_x =
             std::max((bar.Min.x + bar.Max.x - title_size.x) * 0.5f, static_cast<float>(caption_.left));
+        const float title_y = (bar.Min.y + bar.Max.y - title_size.y) * 0.5f;
         dl->PushClipRect({static_cast<float>(caption_.left), bar.Min.y}, {buttons_x, bar.Max.y}, true);
-        dl->AddText({title_x, (bar.Min.y + bar.Max.y - title_size.y) * 0.5f},
-                    ImGui::GetColorU32(ImGuiCol_TextDisabled, focused_ ? 1.0f : 0.6f), title_utf8_.c_str());
+        dl->AddText({title_x, title_y}, ImGui::GetColorU32(ImGuiCol_TextDisabled, focused_ ? 1.0f : 0.6f),
+                    title_utf8_.c_str());
         dl->PopClipRect();
+        title_ = {.left = static_cast<LONG>(title_x),
+                  .top = static_cast<LONG>(bar.Min.y),
+                  .right = static_cast<LONG>(std::min(title_x + title_size.x, buttons_x)),
+                  .bottom = static_cast<LONG>(bar.Max.y)};
+        if (title_menu_)
+        {
+            title_menu_ = false;
+            ImGui::OpenPopup("##title");
+        }
+        if (ImGui::BeginPopup("##title"))
+        {
+            if (ImGui::MenuItem("Copy File Path", nullptr, false, !path_.empty()))
+            {
+                ImGui::SetClipboardText(to_utf8(path_.wstring()).c_str());
+                show_toast("Copied file path");
+            }
+            ImGui::EndPopup();
+        }
 
         const ImU32 ink = ImGui::GetColorU32(ImGuiCol_Text, focused_ ? 0.9f : 0.5f);
         const float g = 5.0f * dpi_scale_; // half the glyph size
@@ -1259,30 +1288,17 @@ namespace simple_notepad
 
     void app::load_settings()
     {
-        std::ifstream in(settings_path());
-        settings loaded;
-        RECT& r = loaded.window;
-        if (in >> r.left >> r.top >> r.right >> r.bottom >> loaded.maximized >> loaded.wrap >> loaded.zoom)
-        {
-            loaded.zoom = std::clamp(loaded.zoom, MIN_ZOOM, MAX_ZOOM);
-            // optional: older settings files end before it, and a failed read would zero the flag
-            if (int minimap = 1; in >> minimap)
-            {
-                loaded.minimap = minimap != 0;
-            }
-            settings_ = loaded;
-        }
+        const ini file = ini::load(settings_path());
+        file.get("view", "wrap", settings_.wrap);
+        file.get("view", "minimap", settings_.minimap);
     }
 
     void app::save_settings() const
     {
-        WINDOWPLACEMENT placement{.length = sizeof(WINDOWPLACEMENT)};
-        GetWindowPlacement(hwnd_, &placement);
-        const RECT& r = placement.rcNormalPosition;
-        std::ofstream out(settings_path(), std::ios::trunc);
-        out << std::format("{} {} {} {} {} {} {} {}\n", r.left, r.top, r.right, r.bottom,
-                           static_cast<int>(placement.showCmd == SW_SHOWMAXIMIZED), static_cast<int>(settings_.wrap),
-                           settings_.zoom, static_cast<int>(settings_.minimap));
+        ini file;
+        file.set("view", "wrap", settings_.wrap);
+        file.set("view", "minimap", settings_.minimap);
+        file.save(settings_path());
     }
 
     std::optional<std::filesystem::path> app::file_dialog(HWND owner, bool save, const std::wstring& initial)

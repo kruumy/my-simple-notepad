@@ -33,8 +33,6 @@ namespace simple_notepad
 
         struct settings
         {
-            RECT window{CW_USEDEFAULT, CW_USEDEFAULT, 0, 0};
-            bool maximized = false;
             bool wrap = true;
             bool minimap = true;
             float zoom = 1.0f;
@@ -63,6 +61,8 @@ namespace simple_notepad
         std::wstring shown_title_;
         std::string title_utf8_;
         RECT caption_{}; // client-space strip of the menu bar that drags the window
+        RECT title_{};   // client-space bounds of the title text, right-click copies the path
+        bool title_menu_ = false;
 
         // view
         settings settings_;
