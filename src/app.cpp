@@ -932,6 +932,10 @@ namespace simple_notepad
             ImGui::AlignTextToFramePadding();
             ImGui::TextColored({0.55f, 0.72f, 1.0f, alpha}, "%s", toast_.c_str());
         }
+        else
+        {
+            ImGui::Dummy({0, ImGui::GetFrameHeight()}); // gives the SameLine below a centred line to join
+        }
 
         const std::string position = std::format("Ln {}, Col {}", editor_.line(), editor_.column());
         const std::string count = std::format("{} characters", editor_.char_count());

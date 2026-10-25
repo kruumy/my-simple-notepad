@@ -262,9 +262,13 @@ namespace simple_notepad
             line_start = fresh.back().end + 1;
         }
         const int line_delta = line - old_last_line;
+        const bool unwrapped = layout_wrap_width_ < 0.0f;
         const float removed_width =
-            std::ranges::max(std::ranges::subrange(rows_.begin() + r0, rows_.begin() + r1 + 1), {}, &row::width).width;
-        const float fresh_width = std::ranges::max(fresh, {}, &row::width).width;
+            unwrapped ? std::ranges::max(std::ranges::subrange(rows_.begin() + r0, rows_.begin() + r1 + 1), {},
+                                         &row::width)
+                            .width
+                      : 0.0f;
+        const float fresh_width = unwrapped ? std::ranges::max(fresh, {}, &row::width).width : 0.0f;
         rows_.erase(rows_.begin() + r0, rows_.begin() + r1 + 1);
         rows_.insert(rows_.begin() + r0, fresh.begin(), fresh.end());
         std::for_each(rows_.begin() + r0 + static_cast<int>(fresh.size()), rows_.end(), [&](row& r) {
@@ -274,9 +278,9 @@ namespace simple_notepad
         });
         line_count_ += line_delta;
         // only a full rescan finds the next widest row once the widest one shrinks
-        if (fresh_width >= content_width_ || layout_wrap_width_ >= 0.0f)
+        if (!unwrapped || fresh_width >= content_width_)
         {
-            content_width_ = layout_wrap_width_ < 0.0f ? fresh_width : layout_wrap_width_;
+            content_width_ = unwrapped ? fresh_width : layout_wrap_width_;
         }
         else if (removed_width >= content_width_)
         {
@@ -1013,7 +1017,7 @@ namespace simple_notepad
         const double now = ImGui::GetTime();
         std::erase_if(fades_, [&](const fade& f) { return now - f.time >= FADE_SECONDS; });
 
-        // draws [p, q) starting at x and returns the end x, splitting it where recently typed characters fade and rise in
+        // draws [p, q) from x and returns the end x, split where recently typed characters fade and rise in
         const auto draw_run = [&](int p, int q, float x, float y) {
             while (p < q)
             {
@@ -1140,7 +1144,7 @@ namespace simple_notepad
                 continue;
             }
             const char* const end = std::format_to_n(label.data(), label.size(), "{}", rows_[r].line + 1).out;
-            // digits share one width in the editor fonts
+            // consolas and both fallbacks (segoe ui, proggy clean) have tabular digits
             const float w = static_cast<float>(end - label.data()) * ascii_advance_['0'];
             dl->AddText({x + width - (PAD * 0.75f * dpi_) - w, origin_y + (static_cast<float>(r) * lh) + text_offset},
                         rows_[r].line == caret_line ? bright : dim, label.data(), end);
@@ -1166,7 +1170,7 @@ namespace simple_notepad
         const float view_h = view_height_ / line_height_ * row_h;
 
         // off-frame teardrop, sized by last frame's animation so it can be grabbed before the minimap
-        // radius, tip and centre for the current teardrop_; slides in from the edge while it grows
+        // a lambda so the draw below picks up this frame's updated teardrop_; slides in from the edge while it grows
         const float drop_y = view_top + (std::min(view_h, height_) * 0.5f);
         const auto drop_shape = [&] {
             const float r = 4.5f * dpi_ * teardrop_;
