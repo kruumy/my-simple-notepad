@@ -1,0 +1,14 @@
+BasedOnStyle: Microsoft
+NamespaceIndentation: All
+PointerAlignment: Left
+InsertBraces: true
+SortIncludes:
+  Enabled: true
+IncludeBlocks: Merge
+IncludeCategories:
+  - Regex: '^".*"$'
+    Priority: 0
+  - Regex: '^<windows\.h>$'
+    Priority: 1
+  - Regex: ".*"
+    Priority: 2
