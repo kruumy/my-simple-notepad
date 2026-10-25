@@ -139,8 +139,6 @@ namespace simple_notepad
         float scroll_y_ = 0.0f;
         float target_x_ = 0.0f;
         float target_y_ = 0.0f;
-        float scroll_max_x_ = 0.0f;
-        float scroll_max_y_ = 0.0f;
         float view_left_ = 0.0f; // screen x of the text view
         float view_width_ = 0.0f;
         float view_height_ = 0.0f;
