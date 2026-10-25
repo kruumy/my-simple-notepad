@@ -457,7 +457,7 @@ namespace simple_notepad
 
         // snaps: animating the size rebakes glyphs, uploads the atlas and relayouts every line each frame
         zoom_shown_ = settings_.zoom;
-        find_anim_ = motion::approach(find_anim_, find_open_ ? 1.0f : 0.0f, 16.0f, 0.002f);
+        find_anim_ = motion::approach(find_anim_, find_open_ ? 1.0f : 0.0f, 26.0f, 0.002f);
         handle_shortcuts();
 
         const ImGuiViewport* viewport = ImGui::GetMainViewport();
@@ -822,17 +822,27 @@ namespace simple_notepad
         const float rows = show_replace_ ? 2.0f : 1.0f;
         const float full =
             (rows * ImGui::GetFrameHeight()) + ((rows - 1.0f) * style.ItemSpacing.y) + (style.WindowPadding.y * 2);
-        // a height of 0 would mean "fill the rest" to imgui and push the editor out for a frame
         const float height = std::floor(full * eased);
-        if (height < 1.0f)
+        if (height < 4.0f)
         {
+            // imgui sizes no child below 4 px; the bar is all but faded by now, so just hold its unrounded space
+            if (eased > 0.0f)
+            {
+                ImGui::Dummy({0, full * eased});
+                ImGui::SetCursorPosY(ImGui::GetCursorPosY() - (style.ItemSpacing.y * (1.0f - eased)));
+            }
             return;
         }
 
         ImGui::PushStyleVar(ImGuiStyleVar_Alpha, eased);
         ImGui::PushStyleColor(ImGuiCol_ChildBg, style.Colors[ImGuiCol_MenuBarBg]);
+        // a full-width strip, so square corners; imgui also keeps any window at least WindowRounding - 1 tall,
+        // which would stall the collapse and then pop the editor up
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 0.0f);
         ImGui::BeginChild("##find", {0, height}, ImGuiChildFlags_AlwaysUseWindowPadding,
                           ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        ImGui::PopStyleVar(2);
         // slide the contents in from above rather than just clipping them
         ImGui::SetCursorPosY(ImGui::GetCursorPosY() - (full * (1.0f - eased)));
 
@@ -902,6 +912,8 @@ namespace simple_notepad
             }
         }
         ImGui::EndChild();
+        // the item gap below the bar shrinks with it, else the editor hops by that gap when the bar goes
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() - (style.ItemSpacing.y * (1.0f - eased)));
         ImGui::PopStyleColor();
         ImGui::PopStyleVar();
     }
