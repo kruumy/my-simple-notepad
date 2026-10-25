@@ -31,6 +31,8 @@ namespace simple_notepad
     constexpr float FADE_RISE = 4.0f; // new characters float up into place by this many pixels
     constexpr size_t MAX_FADE_BYTES = 4096;
     constexpr float PIXEL_SNAP = 0.5f;
+    constexpr ImU32 MATCH_COLOR = IM_COL32(234, 92, 0, 85); // vs code's find highlight
+    constexpr ImU32 MATCH_MARK_COLOR = IM_COL32(209, 134, 22, 255);
 
     // 0 space, 1 word, 2 punctuation, 3 newline
     static int char_class(char c)
@@ -53,6 +55,7 @@ namespace simple_notepad
     {
         text_ = std::move(text);
         fades_.clear();
+        matches_dirty_ = true;
         undo_.clear();
         redo_.clear();
         caret_ = anchor_ = 0;
@@ -84,7 +87,6 @@ namespace simple_notepad
         preferred_x_ = -1.0f;
         scroll_to_caret_ = true;
         caret_moved_ = ImGui::GetTime();
-        focus_request_ = true;
     }
 
     void editor::focus()
@@ -108,6 +110,56 @@ namespace simple_notepad
         const auto start = text_.begin() + (found == std::string::npos ? 0 : static_cast<int>(found) + 1);
         return 1 + static_cast<int>(
                        std::count_if(start, text_.begin() + caret_, [](char c) { return (c & 0xC0) != 0x80; }));
+    }
+
+    void editor::set_search(std::string_view needle, bool match_case)
+    {
+        if (needle != needle_ || match_case != needle_case_)
+        {
+            needle_ = needle;
+            needle_case_ = match_case;
+            matches_dirty_ = true;
+        }
+    }
+
+    std::optional<size_t> editor::search(size_t from, bool backward) const
+    {
+        const std::string_view text = text_;
+        const std::string_view needle = needle_;
+        const auto fold = [](char c) { return c >= 'A' && c <= 'Z' ? static_cast<char>(c + 32) : c; };
+        const auto equal = [&](char a, char b) { return needle_case_ ? a == b : fold(a) == fold(b); };
+
+        if (backward)
+        {
+            const auto head = text.substr(0, std::min(from, text.size()));
+            const auto hit = std::ranges::find_end(head, needle, equal);
+            if (!hit.empty())
+            {
+                return static_cast<size_t>(hit.begin() - head.begin());
+            }
+            const auto wrapped = std::ranges::find_end(text, needle, equal);
+            return wrapped.empty() ? std::nullopt : std::optional(static_cast<size_t>(wrapped.begin() - text.begin()));
+        }
+        const auto tail = text.substr(std::min(from, text.size()));
+        const auto hit = std::ranges::search(tail, needle, equal);
+        if (!hit.empty())
+        {
+            return from + static_cast<size_t>(hit.begin() - tail.begin());
+        }
+        const auto wrapped = std::ranges::search(text, needle, equal);
+        return wrapped.empty() ? std::nullopt : std::optional(static_cast<size_t>(wrapped.begin() - text.begin()));
+    }
+
+    std::pair<int, int> editor::match_status()
+    {
+        if (matches_dirty_)
+        {
+            find_matches();
+        }
+        const auto [lo, hi] = selection();
+        const auto it = std::ranges::lower_bound(matches_, lo, {}, &std::pair<int, int>::first);
+        const bool on_match = it != matches_.end() && it->first == lo && it->second == hi;
+        return {on_match ? static_cast<int>(it - matches_.begin()) : -1, static_cast<int>(matches_.size())};
     }
 
     std::uint64_t editor::state() const
@@ -219,6 +271,7 @@ namespace simple_notepad
         const auto chars = [](std::string_view s) {
             return static_cast<int>(std::ranges::count_if(s, [](char c) { return (c & 0xC0) != 0x80; }));
         };
+        matches_dirty_ = true;
         std::erase_if(fades_, [&](const fade& f) { return f.end > pos && f.start < pos + remove; });
         std::ranges::for_each(fades_, [&](fade& f) {
             if (f.start >= pos)
@@ -285,6 +338,23 @@ namespace simple_notepad
         else if (removed_width >= content_width_)
         {
             update_content_width();
+        }
+    }
+
+    void editor::find_matches()
+    {
+        matches_dirty_ = false;
+        matches_.clear();
+        // raw loop: search() wraps around, so stop once a hit lands before the cursor
+        for (size_t from = 0; std::cmp_less(matches_.size(), MAX_MATCHES);)
+        {
+            const auto hit = search(from, false);
+            if (!hit || *hit < from)
+            {
+                break;
+            }
+            matches_.emplace_back(static_cast<int>(*hit), static_cast<int>(*hit + needle_.size()));
+            from = *hit + needle_.size();
         }
     }
 
@@ -982,6 +1052,11 @@ namespace simple_notepad
             caret_moved_ = ImGui::GetTime();
         }
         clamp_targets();
+        show_matches_ = v.show_matches;
+        if (matches_dirty_ && show_matches_)
+        {
+            find_matches();
+        }
         draw_text(origin_x, origin_y);
         ImGui::EndChild();
         ImGui::PopStyleVar();
@@ -1050,10 +1125,24 @@ namespace simple_notepad
             dl->AddRectFilled({inner.Min.x, y}, {inner.Max.x, y + lh}, IM_COL32(255, 255, 255, 9));
         }
 
+        auto match = show_matches_
+                         ? std::ranges::upper_bound(matches_, rows_[first].start, {}, &std::pair<int, int>::second)
+                         : matches_.end();
         for (int r = first; r <= last; ++r) // raw loop: visible rows by index
         {
             const row& w = rows_[r];
             const float y = origin_y + (static_cast<float>(r) * lh);
+            // raw loop: walks the sorted matches alongside the rows; one wrapped across rows shows on each
+            for (; match != matches_.end() && match->first < w.end; ++match)
+            {
+                const float x0 = origin_x + measure(w.start, std::max(match->first, w.start));
+                const float x1 = origin_x + measure(w.start, std::min(match->second, w.end));
+                dl->AddRectFilled({x0, y}, {x1, y + lh}, MATCH_COLOR, 3.0f * dpi_);
+                if (match->second > w.end)
+                {
+                    break; // continues on the next row
+                }
+            }
             if (lo != hi && lo <= w.end && hi >= w.start)
             {
                 const int a = std::max(lo, w.start);
@@ -1274,6 +1363,25 @@ namespace simple_notepad
             if (run >= 0.0f)
             {
                 dl->AddRectFilled({left + (run * scale), y}, {left + (std::min(cx, max_x) * scale), y + block_h}, ink);
+            }
+        }
+        auto match = show_matches_
+                         ? std::ranges::upper_bound(matches_, rows_[first].start, {}, &std::pair<int, int>::second)
+                         : matches_.end();
+        for (int r = first; r <= last && match != matches_.end(); ++r) // raw loop: visible rows by index
+        {
+            const row& w = rows_[r];
+            const float y = std::round(top_ + (static_cast<float>(r) * row_h) - offset);
+            // raw loop: as in draw_text; at least 2 px wide so a short match still shows
+            for (; match != matches_.end() && match->first < w.end; ++match)
+            {
+                const float x0 = left + (std::min(measure(w.start, std::max(match->first, w.start)), max_x) * scale);
+                const float x1 = left + (std::min(measure(w.start, std::min(match->second, w.end)), max_x) * scale);
+                dl->AddRectFilled({x0, y}, {std::max(x1, x0 + (2.0f * dpi_)), y + row_h}, MATCH_MARK_COLOR);
+                if (match->second > w.end)
+                {
+                    break;
+                }
             }
         }
         // spans the full width unless the text is wider than the view

@@ -78,6 +78,7 @@ namespace simple_notepad
         bool match_case_ = false;
         bool find_cycling_ = false;
         float find_anim_ = 0.0f;
+        float replace_anim_ = 0.0f;
         std::string find_text_;
         std::string replace_text_;
 
@@ -113,8 +114,9 @@ namespace simple_notepad
         void perform(action next);
         void open(const std::filesystem::path& path);
         bool save(bool save_as);
-        [[nodiscard]] std::optional<size_t> search(size_t from, bool backward) const;
+        bool select_match(size_t from, bool backward);
         void find_next(bool backward);
+        void replace_next();
         void replace_all();
         void set_zoom(float zoom);
         void show_toast(std::string text);

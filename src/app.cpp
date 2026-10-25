@@ -35,7 +35,7 @@ namespace simple_notepad
     constexpr float MIN_WINDOW_WIDTH = 480.0f; // unscaled pixels
     constexpr float MIN_WINDOW_HEIGHT = 300.0f;
     constexpr double TOAST_SECONDS = 2.2;
-    constexpr double MODAL_FADE_SECONDS = 0.14;
+    constexpr double MODAL_FADE_SECONDS = 0.06;
     constexpr std::uintmax_t MAX_FILE_BYTES = std::uintmax_t{1024} * 1024;
     constexpr ImVec4 CLEAR_COLOR{0.122f, 0.122f, 0.122f, 1.0f};
     constexpr COLORREF WINDOW_BRUSH = RGB(31, 31, 31);
@@ -438,7 +438,8 @@ namespace simple_notepad
     bool app::animating() const
     {
         const double now = ImGui::GetTime();
-        return zoom_shown_ != settings_.zoom || find_anim_ != (find_open_ ? 1.0f : 0.0f) || editor_.animating() ||
+        return zoom_shown_ != settings_.zoom || find_anim_ != (find_open_ ? 1.0f : 0.0f) ||
+               replace_anim_ != (show_replace_ ? 1.0f : 0.0f) || editor_.animating() ||
                now - toast_time_ < TOAST_SECONDS ||
                (pending_ != action::none && now - modal_time_ < MODAL_FADE_SECONDS);
     }
@@ -457,7 +458,12 @@ namespace simple_notepad
 
         // snaps: animating the size rebakes glyphs, uploads the atlas and relayouts every line each frame
         zoom_shown_ = settings_.zoom;
+        // a closed bar opens straight to its final rows; only toggling replace while it shows animates that row
+        replace_anim_ = find_anim_ == 0.0f
+                            ? (show_replace_ ? 1.0f : 0.0f)
+                            : motion::approach(replace_anim_, show_replace_ ? 1.0f : 0.0f, 26.0f, 0.002f);
         find_anim_ = motion::approach(find_anim_, find_open_ ? 1.0f : 0.0f, 26.0f, 0.002f);
+        editor_.set_search(find_text_, match_case_);
         handle_shortcuts();
 
         const ImGuiViewport* viewport = ImGui::GetMainViewport();
@@ -819,7 +825,8 @@ namespace simple_notepad
     {
         const float eased = motion::ease_out(find_anim_);
         const ImGuiStyle& style = ImGui::GetStyle();
-        const float rows = show_replace_ ? 2.0f : 1.0f;
+        const float replace_eased = motion::ease_out(replace_anim_);
+        const float rows = 1.0f + replace_eased;
         const float full =
             (rows * ImGui::GetFrameHeight()) + ((rows - 1.0f) * style.ItemSpacing.y) + (style.WindowPadding.y * 2);
         const float height = std::floor(full * eased);
@@ -856,6 +863,30 @@ namespace simple_notepad
         if (ImGui::InputTextWithHint("##find_text", "Find", &find_text_, ImGuiInputTextFlags_EnterReturnsTrue))
         {
             find_next(ImGui::GetIO().KeyShift);
+            ImGui::SetKeyboardFocusHere(-1); // enter deactivates the field; keep typing or pressing enter in it
+        }
+        if (ImGui::IsItemEdited())
+        {
+            // jump to the first match from the selection's start, so typing more letters keeps the same one
+            editor_.set_search(find_text_, match_case_);
+            select_match(static_cast<size_t>(editor_.selection().first), false);
+        }
+        if (!find_text_.empty())
+        {
+            // drawn inside the field's right end, like vs code, so the buttons never shift as it changes
+            const auto [index, count] = editor_.match_status();
+            const std::string more = count == editor::MAX_MATCHES ? "+" : "";
+            std::string status = "No results";
+            if (count > 0)
+            {
+                status = index < 0 ? std::format("? of {}{}", count, more)
+                                   : std::format("{} of {}{}", index + 1, count, more);
+            }
+            const ImVec2 max = ImGui::GetItemRectMax();
+            const ImVec2 size = ImGui::CalcTextSize(status.c_str());
+            ImGui::GetWindowDrawList()->AddText(
+                {max.x - size.x - style.FramePadding.x, max.y - style.FramePadding.y - size.y},
+                ImGui::GetColorU32(ImGuiCol_TextDisabled), status.c_str());
         }
         if (ImGui::IsItemDeactivated() && ImGui::IsKeyPressed(ImGuiKey_Escape))
         {
@@ -875,20 +906,10 @@ namespace simple_notepad
         }
         ImGui::SetItemTooltip("Next (F3)");
         ImGui::SameLine();
-        if (match_case_)
+        if (ImGui::Checkbox("Match case", &match_case_))
         {
-            ImGui::PushStyleColor(ImGuiCol_Button, style.Colors[ImGuiCol_HeaderActive]);
+            editor_.set_search(find_text_, match_case_);
         }
-        const bool toggled = ImGui::Button("Aa");
-        if (match_case_)
-        {
-            ImGui::PopStyleColor();
-        }
-        if (toggled)
-        {
-            match_case_ = !match_case_;
-        }
-        ImGui::SetItemTooltip("Match case");
         ImGui::SameLine();
         if (ImGui::Button(show_replace_ ? "Hide replace" : "Replace..."))
         {
@@ -901,15 +922,28 @@ namespace simple_notepad
             editor_.focus();
         }
 
-        if (show_replace_)
+        if (replace_eased > 0.0f)
         {
+            ImGui::PushStyleVar(ImGuiStyleVar_Alpha, style.Alpha * replace_eased);
             ImGui::SetNextItemWidth(field);
-            ImGui::InputTextWithHint("##replace_text", "Replace with", &replace_text_);
+            if (ImGui::InputTextWithHint("##replace_text", "Replace with", &replace_text_,
+                                         ImGuiInputTextFlags_EnterReturnsTrue))
+            {
+                replace_next();
+                ImGui::SetKeyboardFocusHere(-1);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Replace"))
+            {
+                replace_next();
+            }
+            ImGui::SetItemTooltip("Replace this match and go to the next (Enter)");
             ImGui::SameLine();
             if (ImGui::Button("Replace all"))
             {
                 replace_all();
             }
+            ImGui::PopStyleVar();
         }
         ImGui::EndChild();
         // the item gap below the bar shrinks with it, else the editor hops by that gap when the bar goes
@@ -929,6 +963,7 @@ namespace simple_notepad
             .minimap = settings_.minimap,
             .dpi = dpi_scale_,
             .height = ImGui::GetContentRegionAvail().y - status_height,
+            .show_matches = find_open_,
         });
     }
 
@@ -1169,32 +1204,14 @@ namespace simple_notepad
         }
     }
 
-    std::optional<size_t> app::search(size_t from, bool backward) const
+    bool app::select_match(size_t from, bool backward)
     {
-        const std::string_view text = editor_.text();
-        const std::string_view needle = find_text_;
-        const auto fold = [](char c) { return c >= 'A' && c <= 'Z' ? static_cast<char>(c + 32) : c; };
-        const auto equal = [&](char a, char b) { return match_case_ ? a == b : fold(a) == fold(b); };
-
-        if (backward)
+        const auto found = editor_.search(from, backward);
+        if (found)
         {
-            const auto head = text.substr(0, std::min(from, text.size()));
-            const auto hit = std::ranges::find_end(head, needle, equal);
-            if (!hit.empty())
-            {
-                return static_cast<size_t>(hit.begin() - head.begin());
-            }
-            const auto wrapped = std::ranges::find_end(text, needle, equal);
-            return wrapped.empty() ? std::nullopt : std::optional(static_cast<size_t>(wrapped.begin() - text.begin()));
+            editor_.select(static_cast<int>(*found), static_cast<int>(*found + find_text_.size()));
         }
-        const auto tail = text.substr(std::min(from, text.size()));
-        const auto hit = std::ranges::search(tail, needle, equal);
-        if (!hit.empty())
-        {
-            return from + static_cast<size_t>(hit.begin() - tail.begin());
-        }
-        const auto wrapped = std::ranges::search(text, needle, equal);
-        return wrapped.empty() ? std::nullopt : std::optional(static_cast<size_t>(wrapped.begin() - text.begin()));
+        return found.has_value();
     }
 
     void app::find_next(bool backward)
@@ -1205,14 +1222,32 @@ namespace simple_notepad
             return;
         }
         const auto [lo, hi] = editor_.selection();
-        const auto found = search(static_cast<size_t>(backward ? lo : hi), backward);
-        if (!found)
+        if (!select_match(static_cast<size_t>(backward ? lo : hi), backward))
         {
             show_toast(std::format("\"{}\" not found", find_text_));
             return;
         }
-        editor_.select(static_cast<int>(*found), static_cast<int>(*found + find_text_.size()));
-        find_cycling_ = true;
+        // only while the editor has focus: enter there keeps jumping, while the find bar handles its own enter
+        find_cycling_ = editor_.focused();
+    }
+
+    void app::replace_next()
+    {
+        if (find_text_.empty())
+        {
+            return;
+        }
+        // the selected match is replaced, then the next one selected; focus stays in the find bar for another enter
+        const auto [lo, hi] = editor_.selection();
+        if (editor_.search(static_cast<size_t>(lo), false) == static_cast<size_t>(lo) &&
+            std::cmp_equal(hi - lo, find_text_.size()))
+        {
+            editor_.insert(replace_text_);
+        }
+        if (!select_match(static_cast<size_t>(editor_.selection().second), false))
+        {
+            show_toast(std::format("\"{}\" not found", find_text_));
+        }
     }
 
     void app::replace_all()
@@ -1227,7 +1262,7 @@ namespace simple_notepad
         size_t from = 0;
         int replaced = 0;
         // raw loop: search() wraps around, so stop once a hit lands before the cursor
-        while (const auto hit = search(from, false))
+        while (const auto hit = editor_.search(from, false))
         {
             if (*hit < from)
             {

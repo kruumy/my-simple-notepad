@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <deque>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -25,15 +26,22 @@ namespace simple_notepad
             bool minimap = true;
             float dpi = 1.0f;
             float height = 0.0f;
+            bool show_matches = false; // highlights in the text and marks in the minimap
         };
+
+        static constexpr int MAX_MATCHES = 20000; // bounds time and memory for a short needle in a huge file
 
         void draw(const view& v);
 
         void set_text(std::string text);           // clears undo history
         void replace_all(const std::string& text); // one undoable step
         void insert(std::string_view text);
-        void select(int start, int end);
+        void select(int start, int end); // leaves focus where it is
         void focus();
+        void set_search(std::string_view needle, bool match_case);
+        [[nodiscard]] std::optional<size_t> search(size_t from, bool backward) const; // wraps around
+        // index of the selected match (-1 when the selection is not one) and the match count
+        [[nodiscard]] std::pair<int, int> match_status();
 
         [[nodiscard]] const std::string& text() const
         {
@@ -100,6 +108,11 @@ namespace simple_notepad
 
         std::string text_;
         std::vector<fade> fades_; // recently inserted byte ranges that are still fading in
+        std::string needle_;
+        bool needle_case_ = false;
+        bool matches_dirty_ = false;
+        bool show_matches_ = false;
+        std::vector<std::pair<int, int>> matches_; // sorted, non-overlapping byte ranges of needle_
         std::vector<row> rows_{{.start = 0, .end = 0, .line = 0, .first = true, .width = 0.0f}};
         int line_count_ = 1;
         int char_count_ = 0;
@@ -154,6 +167,7 @@ namespace simple_notepad
         void rebuild_layout(float wrap_width);
         void replace_text(int pos, int remove, std::string_view insert);
         void update_content_width();
+        void find_matches();
         [[nodiscard]] int row_of(int pos) const;
         [[nodiscard]] float x_of(int pos) const;
         [[nodiscard]] int pos_at(int row_index, float x) const;
