@@ -7,6 +7,7 @@
 #include "imgui_impl_dx11.h"
 #include "imgui_impl_win32.h"
 #include "imgui_internal.h"
+#include "motion.h"
 #include "misc/cpp/imgui_stdlib.h"
 #include <windows.h>
 #include <algorithm>
@@ -35,35 +36,9 @@ namespace simple_notepad
     constexpr float MIN_WINDOW_HEIGHT = 300.0f;
     constexpr double TOAST_SECONDS = 2.2;
     constexpr double MODAL_FADE_SECONDS = 0.14;
-    constexpr std::uintmax_t MAX_FILE_BYTES = static_cast<const std::uintmax_t>(1024 * 1024);
+    constexpr std::uintmax_t MAX_FILE_BYTES = std::uintmax_t{1024} * 1024;
     constexpr ImVec4 CLEAR_COLOR{0.122f, 0.122f, 0.122f, 1.0f};
     constexpr COLORREF WINDOW_BRUSH = RGB(31, 31, 31);
-
-    static float ease_out(float t)
-    {
-        t = std::clamp(t, 0.0f, 1.0f);
-        return 1.0f - ((1.0f - t) * (1.0f - t) * (1.0f - t));
-    }
-
-    // frame-rate independent exponential approach
-    static float approach(float current, float target, float speed)
-    {
-        const float next = current + ((target - current) * (1.0f - std::exp(-speed * ImGui::GetIO().DeltaTime)));
-        return std::abs(target - next) < 0.002f ? target : next;
-    }
-
-    static std::string to_utf8(const std::wstring& wide)
-    {
-        if (wide.empty())
-        {
-            return {};
-        }
-        const int len =
-            WideCharToMultiByte(CP_UTF8, 0, wide.data(), static_cast<int>(wide.size()), nullptr, 0, nullptr, nullptr);
-        std::string out(static_cast<size_t>(len), '\0');
-        WideCharToMultiByte(CP_UTF8, 0, wide.data(), static_cast<int>(wide.size()), out.data(), len, nullptr, nullptr);
-        return out;
-    }
 
     static void apply_theme(ImGuiStyle& style)
     {
@@ -84,7 +59,7 @@ namespace simple_notepad
         style.FrameBorderSize = 0;
         style.SelectableTextAlign = {0.0f, 0.5f};
 
-        const ImVec4 bg{0.122f, 0.122f, 0.122f, 1.0f}; // vs code dark modern;
+        const ImVec4 bg = CLEAR_COLOR; // vs code dark modern
         const ImVec4 panel{0.094f, 0.094f, 0.094f, 1.0f};
         const ImVec4 raised{0.192f, 0.192f, 0.192f, 1.0f};
         const ImVec4 hover{0.165f, 0.176f, 0.180f, 1.0f};
@@ -96,7 +71,7 @@ namespace simple_notepad
         c[ImGuiCol_TextDisabled] = {0.431f, 0.463f, 0.506f, 1.0f};
         c[ImGuiCol_WindowBg] = bg;
         c[ImGuiCol_ChildBg] = {0, 0, 0, 0};
-        c[ImGuiCol_PopupBg] = {0.122f, 0.122f, 0.122f, 1.0f};
+        c[ImGuiCol_PopupBg] = bg;
         c[ImGuiCol_Border] = {0.169f, 0.169f, 0.169f, 1.0f};
         c[ImGuiCol_FrameBg] = raised;
         c[ImGuiCol_FrameBgHovered] = hover;
@@ -163,8 +138,8 @@ namespace simple_notepad
         std::wstring windows_dir(MAX_PATH, L'\0');
         windows_dir.resize(GetWindowsDirectoryW(windows_dir.data(), MAX_PATH));
         const std::filesystem::path fonts = std::filesystem::path(windows_dir) / L"Fonts";
-        const std::string ui_path = to_utf8((fonts / L"segoeui.ttf").wstring());
-        const std::string mono_path = to_utf8((fonts / L"consola.ttf").wstring());
+        const std::string ui_path = text_file::to_utf8((fonts / L"segoeui.ttf").wstring());
+        const std::string mono_path = text_file::to_utf8((fonts / L"consola.ttf").wstring());
         const bool have_ui = std::filesystem::exists(fonts / L"segoeui.ttf");
         ui_font_ = have_ui ? io.Fonts->AddFontFromFileTTF(ui_path.c_str(), BASE_FONT_SIZE) : io.Fonts->AddFontDefault();
         editor_font_ = std::filesystem::exists(fonts / L"consola.ttf")
@@ -475,7 +450,7 @@ namespace simple_notepad
 
         // snaps: animating the size rebakes glyphs, uploads the atlas and relayouts every line each frame
         zoom_shown_ = settings_.zoom;
-        find_anim_ = approach(find_anim_, find_open_ ? 1.0f : 0.0f, 16.0f);
+        find_anim_ = motion::approach(find_anim_, find_open_ ? 1.0f : 0.0f, 16.0f, 0.002f);
         handle_shortcuts();
 
         const ImGuiViewport* viewport = ImGui::GetMainViewport();
@@ -750,7 +725,7 @@ namespace simple_notepad
         {
             if (ImGui::MenuItem("Copy File Path", nullptr, false, !path_.empty()))
             {
-                ImGui::SetClipboardText(to_utf8(path_.wstring()).c_str());
+                ImGui::SetClipboardText(text_file::to_utf8(path_.wstring()).c_str());
                 show_toast("Copied file path");
             }
             ImGui::EndPopup();
@@ -835,7 +810,7 @@ namespace simple_notepad
 
     void app::draw_find_bar()
     {
-        const float eased = ease_out(find_anim_);
+        const float eased = motion::ease_out(find_anim_);
         const ImGuiStyle& style = ImGui::GetStyle();
         const float rows = show_replace_ ? 2.0f : 1.0f;
         const float full =
@@ -948,17 +923,12 @@ namespace simple_notepad
         ImGui::BeginChild("##status", {0, 0}, ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NoScrollbar);
         ImGui::SetCursorPosY((ImGui::GetWindowHeight() - ImGui::GetFrameHeight()) * 0.5f);
 
-        ImGui::AlignTextToFramePadding();
-        const ImGuiIO& io = ImGui::GetIO();
-        ImGui::TextDisabled("%.0f fps  dt %.2f ms", io.Framerate, io.DeltaTime * 1000.0f);
-        ImGui::SameLine(0, style.ItemSpacing.x * 2);
-
         const double since = ImGui::GetTime() - toast_time_;
         if (since < TOAST_SECONDS)
         {
             // quick fade in, hold, then a slow fade out
-            const float alpha = std::min(ease_out(static_cast<float>(since) / 0.15f),
-                                         ease_out(static_cast<float>(TOAST_SECONDS - since) / 0.6f));
+            const float alpha = std::min(motion::ease_out(static_cast<float>(since) / 0.15f),
+                                         motion::ease_out(static_cast<float>(TOAST_SECONDS - since) / 0.6f));
             ImGui::AlignTextToFramePadding();
             ImGui::TextColored({0.55f, 0.72f, 1.0f, alpha}, "%s", toast_.c_str());
         }
@@ -1028,7 +998,7 @@ namespace simple_notepad
             ImGui::OpenPopup(id);
             modal_time_ = ImGui::GetTime();
         }
-        const float t = ease_out(static_cast<float>((ImGui::GetTime() - modal_time_) / MODAL_FADE_SECONDS));
+        const float t = motion::ease_out(static_cast<float>((ImGui::GetTime() - modal_time_) / MODAL_FADE_SECONDS));
         ImVec4 dim = ImGui::GetStyle().Colors[ImGuiCol_ModalWindowDimBg];
         dim.w *= t;
         ImGui::PushStyleColor(ImGuiCol_ModalWindowDimBg, dim);
@@ -1042,7 +1012,7 @@ namespace simple_notepad
         if (ImGui::BeginPopupModal(
                 id, nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove))
         {
-            const std::string name = path_.empty() ? "Untitled" : to_utf8(path_.filename().wstring());
+            const std::string name = path_.empty() ? "Untitled" : text_file::to_utf8(path_.filename().wstring());
             ImGui::Text("Save changes to %s?", name.c_str());
             ImGui::TextDisabled("Your changes will be lost if you don't save them.");
             ImGui::Dummy(ImVec2(0, 6) * dpi_scale_);
@@ -1273,7 +1243,7 @@ namespace simple_notepad
         if (title != shown_title_)
         {
             SetWindowTextW(hwnd_, title.c_str());
-            title_utf8_ = to_utf8(title);
+            title_utf8_ = text_file::to_utf8(title);
             shown_title_ = std::move(title);
         }
     }

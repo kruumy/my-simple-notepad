@@ -71,6 +71,10 @@ namespace simple_notepad
             const std::string_view body = view.substr(2);
             std::wstring wide(body.size() / 2, L'\0');
             std::memcpy(wide.data(), body.data(), wide.size() * 2);
+            if (body.size() % 2 != 0)
+            {
+                wide += L'�'; // a truncated last unit shows up instead of vanishing
+            }
             if (file.encoding == text_encoding::utf16_be)
             {
                 wide = swap_bytes(std::move(wide));
@@ -178,5 +182,10 @@ namespace simple_notepad
             return "ANSI";
         }
         return "";
+    }
+
+    std::string text_file::to_utf8(std::wstring_view wide)
+    {
+        return from_wide(wide, CP_UTF8);
     }
 } // namespace simple_notepad

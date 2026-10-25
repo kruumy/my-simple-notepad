@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <string_view>
 
 namespace simple_notepad
 {
@@ -26,5 +27,6 @@ namespace simple_notepad
         void save(const std::filesystem::path& path) const;
 
         [[nodiscard]] static const char* encoding_name(text_encoding encoding);
+        [[nodiscard]] static std::string to_utf8(std::wstring_view wide);
     };
 } // namespace simple_notepad
