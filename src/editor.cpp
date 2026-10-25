@@ -3,7 +3,6 @@
 #define IMGUI_DEFINE_MATH_OPERATORS
 #include "imgui.h"
 #include "imgui_internal.h"
-
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -28,7 +27,7 @@ namespace simple_notepad
 
     static float approach(float current, float target, float speed)
     {
-        const float next = current + (target - current) * (1.0f - std::exp(-speed * ImGui::GetIO().DeltaTime));
+        const float next = current + ((target - current) * (1.0f - std::exp(-speed * ImGui::GetIO().DeltaTime)));
         return std::abs(target - next) < 0.5f ? target : next;
     }
 
@@ -62,7 +61,7 @@ namespace simple_notepad
         focus_request_ = true;
     }
 
-    void editor::replace_all(std::string text)
+    void editor::replace_all(const std::string& text)
     {
         const int caret = caret_;
         apply(0, static_cast<int>(text_.size()), text, merge::none);
@@ -131,7 +130,7 @@ namespace simple_notepad
     {
         if (c == '\t')
         {
-            return (std::floor(x / tab_width_) + 1.0f) * tab_width_ - x;
+            return ((std::floor(x / tab_width_) + 1.0f) * tab_width_) - x;
         }
         return c < 128 ? ascii_advance_[c] : baked_->GetCharAdvance(static_cast<ImWchar>(c));
     }
@@ -174,7 +173,7 @@ namespace simple_notepad
             if (x + w > layout_wrap_width_ && p > row_start)
             {
                 const int at = last_break > row_start ? last_break : p;
-                out.push_back({row_start, at, line, first, 0.0f});
+                out.push_back({.start = row_start, .end = at, .line = line, .first = first, .width = 0.0f});
                 first = false;
                 row_start = at;
                 last_break = -1;
@@ -188,7 +187,7 @@ namespace simple_notepad
             }
             p += len;
         }
-        out.push_back({row_start, line_end, line, first, 0.0f});
+        out.push_back({.start = row_start, .end = line_end, .line = line, .first = first, .width = 0.0f});
     }
 
     void editor::rebuild_layout(float wrap_width)
@@ -201,7 +200,7 @@ namespace simple_notepad
         for (int line_start = 0;; ++line)
         {
             layout_line(line_start, line, rows_);
-            if (rows_.back().end >= static_cast<int>(text_.size()))
+            if (std::cmp_greater_equal(rows_.back().end, text_.size()))
             {
                 break;
             }
@@ -274,9 +273,8 @@ namespace simple_notepad
 
     void editor::update_content_width()
     {
-        content_width_ = layout_wrap_width_ < 0.0f
-                             ? std::ranges::max(rows_, {}, &row::width).width
-                             : layout_wrap_width_;
+        content_width_ =
+            layout_wrap_width_ < 0.0f ? std::ranges::max(rows_, {}, &row::width).width : layout_wrap_width_;
     }
 
     int editor::row_of(int pos) const
@@ -301,7 +299,7 @@ namespace simple_notepad
             unsigned int c = 0;
             const int len = ImTextCharFromUtf8(&c, s + p, s + r.end);
             const float w = advance(c, cx);
-            if (cx + w * 0.5f > x)
+            if (cx + (w * 0.5f) > x)
             {
                 return p;
             }
@@ -467,7 +465,7 @@ namespace simple_notepad
         move_caret(pos + static_cast<int>(insert.size()), false);
         if (!insert.empty() && insert.size() <= MAX_FADE_BYTES)
         {
-            fades_.push_back({pos, pos + static_cast<int>(insert.size()), now});
+            fades_.push_back({.start = pos, .end = pos + static_cast<int>(insert.size()), .time = now});
         }
     }
 
@@ -762,7 +760,7 @@ namespace simple_notepad
 
     void editor::draw(const view& v)
     {
-        ImGuiIO& io = ImGui::GetIO();
+        const ImGuiIO& io = ImGui::GetIO();
         dpi_ = v.dpi;
         ImGui::PushFont(v.font, v.font_size);
         const float font_size = ImGui::GetFontSize();
@@ -786,13 +784,13 @@ namespace simple_notepad
         height_ = v.height;
 
         const int digits = std::max(3, static_cast<int>(std::to_string(line_count_).size()));
-        const float gutter_width = static_cast<float>(digits) * ascii_advance_['0'] + pad * 2.0f;
+        const float gutter_width = (static_cast<float>(digits) * ascii_advance_['0']) + (pad * 2.0f);
         const float minimap_width =
             v.minimap && total_width > MINIMAP_MIN_EDITOR_WIDTH * dpi_ ? MINIMAP_WIDTH * dpi_ : 0.0f;
         const float text_width = total_width - gutter_width - minimap_width;
         const float scrollbar = ImGui::GetStyle().ScrollbarSize;
         const float wrap_width =
-            v.wrap ? std::max(text_width - pad * 2.0f - scrollbar, ascii_advance_['M'] * 8.0f) : -1.0f;
+            v.wrap ? std::max(text_width - (pad * 2.0f) - scrollbar, ascii_advance_['M'] * 8.0f) : -1.0f;
         if (layout_dirty_ || wrap_width != layout_wrap_width_)
         {
             rebuild_layout(wrap_width);
@@ -800,8 +798,8 @@ namespace simple_notepad
 
         // allow scrolling half a page past the end, like most code editors
         const auto content_size = [&] {
-            return ImVec2(v.wrap ? 0.0f : content_width_ + pad * 2.0f + ascii_advance_[' '] * 2.0f,
-                          static_cast<float>(rows_.size()) * line_height_ + pad * 2.0f + v.height * 0.5f);
+            return ImVec2(v.wrap ? 0.0f : content_width_ + (pad * 2.0f) + (ascii_advance_[' '] * 2.0f),
+                          (static_cast<float>(rows_.size()) * line_height_) + (pad * 2.0f) + (v.height * 0.5f));
         };
         const auto clamp_targets = [&] {
             const ImVec2 content = content_size();
@@ -863,14 +861,14 @@ namespace simple_notepad
         if (scroll_to_caret_)
         {
             scroll_to_caret_ = false;
-            const float y = static_cast<float>(row_of(caret_)) * line_height_ + pad;
+            const float y = (static_cast<float>(row_of(caret_)) * line_height_) + pad;
             target_y_ = std::clamp(target_y_, y + line_height_ + pad - view_height_, y - pad);
             if (!v.wrap)
             {
                 const float x = x_of(caret_) + pad;
-                if (x < target_x_ + pad * 2.0f || x > target_x_ + view_width_ - pad * 2.0f)
+                if (x < target_x_ + (pad * 2.0f) || x > target_x_ + view_width_ - (pad * 2.0f))
                 {
-                    target_x_ = std::max(0.0f, x - view_width_ * (x < target_x_ + pad * 2.0f ? 0.25f : 0.75f));
+                    target_x_ = std::max(0.0f, x - (view_width_ * (x < target_x_ + (pad * 2.0f) ? 0.25f : 0.75f)));
                 }
             }
             caret_moved_ = ImGui::GetTime();
@@ -935,21 +933,21 @@ namespace simple_notepad
 
         if (focused_ && lo == hi)
         {
-            const float y = origin_y + static_cast<float>(caret_row) * lh;
+            const float y = origin_y + (static_cast<float>(caret_row) * lh);
             dl->AddRectFilled({inner.Min.x, y}, {inner.Max.x, y + lh}, IM_COL32(255, 255, 255, 9));
         }
 
         for (int r = first; r <= last; ++r) // raw loop: visible rows by index
         {
             const row& w = rows_[r];
-            const float y = origin_y + static_cast<float>(r) * lh;
+            const float y = origin_y + (static_cast<float>(r) * lh);
             if (lo != hi && lo <= w.end && hi >= w.start)
             {
                 const int a = std::max(lo, w.start);
                 const int b = std::min(hi, w.end);
-                float x0 = origin_x + measure(w.start, a);
+                const float x0 = origin_x + measure(w.start, a);
                 float x1 = origin_x + measure(w.start, b);
-                if (hi > w.end && w.end < static_cast<int>(text_.size()) && text_[w.end] == '\n')
+                if (hi > w.end && std::cmp_less(w.end, text_.size()) && text_[w.end] == '\n')
                 {
                     x1 += ascii_advance_[' '] * 0.6f; // show that the newline is selected
                 }
@@ -997,13 +995,13 @@ namespace simple_notepad
         {
             return;
         }
-        const bool visible = !caret_settled_ || std::fmod(ImGui::GetTime() - caret_moved_, BLINK_HALF_PERIOD * 2) <
-                                                    BLINK_HALF_PERIOD;
+        const bool visible =
+            !caret_settled_ || std::fmod(ImGui::GetTime() - caret_moved_, BLINK_HALF_PERIOD * 2) < BLINK_HALF_PERIOD;
         const ImVec2 caret{origin_x + caret_x_, origin_y + caret_y_};
         if (visible)
         {
-            dl->AddRectFilled({caret.x - 1.0f * dpi_, caret.y + 2.0f * dpi_},
-                              {caret.x + 1.0f * dpi_, caret.y + lh - 2.0f * dpi_},
+            dl->AddRectFilled({caret.x - (1.0f * dpi_), caret.y + (2.0f * dpi_)},
+                              {caret.x + (1.0f * dpi_), caret.y + lh - (2.0f * dpi_)},
                               ImGui::GetColorU32(ImGuiCol_InputTextCursor), 1.0f * dpi_);
         }
         ImGuiPlatformImeData& ime = GImGui->PlatformImeData;
@@ -1033,9 +1031,9 @@ namespace simple_notepad
             {
                 continue;
             }
-            const auto end = std::format_to_n(label.data(), label.size(), "{}", rows_[r].line + 1).out;
+            const char* const end = std::format_to_n(label.data(), label.size(), "{}", rows_[r].line + 1).out;
             const float w = ImGui::CalcTextSize(label.data(), end).x;
-            dl->AddText({x + width - PAD * 0.75f * dpi_ - w, origin_y + static_cast<float>(r) * lh + text_offset},
+            dl->AddText({x + width - (PAD * 0.75f * dpi_) - w, origin_y + (static_cast<float>(r) * lh) + text_offset},
                         rows_[r].line == caret_line ? bright : dim, label.data(), end);
         }
         dl->PopClipRect();
@@ -1048,17 +1046,18 @@ namespace simple_notepad
         const float row_h = MINIMAP_ROW * dpi_;
         const float scale = MINIMAP_CHAR * dpi_ / ascii_advance_[' '];
         const float total = static_cast<float>(rows_.size()) * row_h;
-        const float scroll_max = std::max(
-            1.0f, static_cast<float>(rows_.size()) * line_height_ + PAD * 2.0f * dpi_ + height_ * 0.5f - view_height_);
+        const float scroll_max = std::max(1.0f, (static_cast<float>(rows_.size()) * line_height_) +
+                                                    (PAD * 2.0f * dpi_) + (height_ * 0.5f) - view_height_);
         // when the whole minimap doesn't fit it scrolls in proportion to the editor
-        const float offset = total > height_ ? std::clamp(scroll_y_ / scroll_max, 0.0f, 1.0f) * (total - height_) : 0.0f;
+        const float offset =
+            total > height_ ? std::clamp(scroll_y_ / scroll_max, 0.0f, 1.0f) * (total - height_) : 0.0f;
 
         ImGui::SetCursorScreenPos({x, top_});
         ImGui::InvisibleButton("##minimap", {width, height_});
         const bool hovered = ImGui::IsItemHovered();
         if (ImGui::IsItemActive())
         {
-            target_y_ = (io.MousePos.y - top_ + offset) / row_h * line_height_ - view_height_ * 0.5f;
+            target_y_ = ((io.MousePos.y - top_ + offset) / row_h * line_height_) - (view_height_ * 0.5f);
         }
         if (ImGui::IsItemDeactivated())
         {
@@ -1072,8 +1071,8 @@ namespace simple_notepad
         dl->PushClipRect({x, top_}, {x + width, top_ + height_}, true);
         dl->AddLine({x, top_}, {x, top_ + height_}, ImGui::GetColorU32(ImGuiCol_Border));
         const ImU32 ink = ImGui::GetColorU32(ImGuiCol_Text, 0.32f);
-        const float left = x + 6.0f * dpi_;
-        const float max_x = (width - 8.0f * dpi_) / scale;
+        const float left = x + (6.0f * dpi_);
+        const float max_x = (width - (8.0f * dpi_)) / scale;
         const int last_row = static_cast<int>(rows_.size()) - 1;
         const int first = std::clamp(static_cast<int>(offset / row_h), 0, last_row);
         const int last = std::clamp(static_cast<int>((offset + height_) / row_h) + 1, 0, last_row);
@@ -1081,7 +1080,7 @@ namespace simple_notepad
         for (int r = first; r <= last; ++r) // raw loop: visible rows by index
         {
             const row& w = rows_[r];
-            const float y = top_ + static_cast<float>(r) * row_h - offset;
+            const float y = top_ + (static_cast<float>(r) * row_h) - offset;
             float cx = 0.0f;
             float run = -1.0f;
             // raw loop: merges each word into one block, like a zoomed-out view of the text
@@ -1096,7 +1095,7 @@ namespace simple_notepad
                 const bool blank = c == ' ' || c == '\t';
                 if (blank && run >= 0.0f)
                 {
-                    dl->AddRectFilled({left + run * scale, y}, {left + cx * scale, y + row_h * 0.7f}, ink);
+                    dl->AddRectFilled({left + (run * scale), y}, {left + (cx * scale), y + (row_h * 0.7f)}, ink);
                     run = -1.0f;
                 }
                 else if (!blank && run < 0.0f)
@@ -1108,11 +1107,11 @@ namespace simple_notepad
             }
             if (run >= 0.0f)
             {
-                dl->AddRectFilled({left + run * scale, y}, {left + std::min(cx, max_x) * scale, y + row_h * 0.7f},
+                dl->AddRectFilled({left + (run * scale), y}, {left + (std::min(cx, max_x) * scale), y + (row_h * 0.7f)},
                                   ink);
             }
         }
-        const float view_top = top_ + scroll_y_ / line_height_ * row_h - offset;
+        const float view_top = top_ + (scroll_y_ / line_height_ * row_h) - offset;
         const float view_h = view_height_ / line_height_ * row_h;
         dl->AddRectFilled({x + 1.0f, view_top}, {x + width, view_top + view_h},
                           IM_COL32(255, 255, 255, hovered || ImGui::IsItemActive() ? 26 : 14));

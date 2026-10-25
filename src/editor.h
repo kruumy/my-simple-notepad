@@ -28,8 +28,8 @@ namespace simple_notepad
 
         void draw(const view& v);
 
-        void set_text(std::string text); // clears undo history
-        void replace_all(std::string text); // one undoable step
+        void set_text(std::string text);           // clears undo history
+        void replace_all(const std::string& text); // one undoable step
         void insert(std::string_view text);
         void select(int start, int end);
         void focus();
@@ -99,7 +99,7 @@ namespace simple_notepad
 
         std::string text_;
         std::vector<fade> fades_; // recently inserted byte ranges that are still fading in
-        std::vector<row> rows_{{0, 0, 0, true, 0.0f}};
+        std::vector<row> rows_{{.start = 0, .end = 0, .line = 0, .first = true, .width = 0.0f}};
         int line_count_ = 1;
         int char_count_ = 0;
 
@@ -144,7 +144,7 @@ namespace simple_notepad
         bool caret_settled_ = true;
         double caret_moved_ = 0.0;
 
-        float advance(unsigned int c, float x) const;
+        [[nodiscard]] float advance(unsigned int c, float x) const;
         [[nodiscard]] float measure(int start, int end) const;
         void layout_line(int line_start, int line, std::vector<row>& out) const;
         void rebuild_layout(float wrap_width);

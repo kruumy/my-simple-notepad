@@ -51,7 +51,8 @@ namespace simple_notepad
         bool running_ = true;
         bool focused_ = true;
         bool in_frame_ = false;
-        int frames_ = 3;        float dpi_scale_ = 1.0f;
+        int frames_ = 3;
+        float dpi_scale_ = 1.0f;
 
         // document
         text_file doc_;

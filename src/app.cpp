@@ -139,10 +139,10 @@ namespace simple_notepad
 
         const RECT& r = settings_.window;
         const bool has_rect = r.right > r.left && MonitorFromRect(&r, MONITOR_DEFAULTTONULL) != nullptr;
-        hwnd_ = CreateWindowExW(WS_EX_ACCEPTFILES, wc.lpszClassName, L"Simple Notepad",
-                                WS_OVERLAPPEDWINDOW, has_rect ? r.left : CW_USEDEFAULT,
-                                has_rect ? r.top : CW_USEDEFAULT, has_rect ? r.right - r.left : 960,
-                                has_rect ? r.bottom - r.top : 640, nullptr, nullptr, wc.hInstance, this);
+        hwnd_ = CreateWindowExW(WS_EX_ACCEPTFILES, wc.lpszClassName, L"Simple Notepad", WS_OVERLAPPEDWINDOW,
+                                has_rect ? r.left : CW_USEDEFAULT, has_rect ? r.top : CW_USEDEFAULT,
+                                has_rect ? r.right - r.left : 960, has_rect ? r.bottom - r.top : 640, nullptr, nullptr,
+                                wc.hInstance, this);
         if (hwnd_ == nullptr || !create_device())
         {
             MessageBoxW(nullptr, L"Could not create a Direct3D 11 device.", L"Simple Notepad", MB_ICONERROR);
@@ -396,8 +396,8 @@ namespace simple_notepad
         case WM_GETMINMAXINFO: {
             auto* info = reinterpret_cast<MINMAXINFO*>(lparam);
             const float scale = static_cast<float>(GetDpiForWindow(hwnd_)) / USER_DEFAULT_SCREEN_DPI;
-            info->ptMinTrackSize = {static_cast<LONG>(MIN_WINDOW_WIDTH * scale),
-                                    static_cast<LONG>(MIN_WINDOW_HEIGHT * scale)};
+            info->ptMinTrackSize = {.x = static_cast<LONG>(MIN_WINDOW_WIDTH * scale),
+                                    .y = static_cast<LONG>(MIN_WINDOW_HEIGHT * scale)};
             return 0;
         }
         case WM_NCHITTEST: {
@@ -454,7 +454,6 @@ namespace simple_notepad
     {
         return format_changed_ || editor_.state() != saved_state_;
     }
-
 
     void app::frame()
     {
@@ -713,8 +712,10 @@ namespace simple_notepad
         const ImRect bar = ImGui::GetCurrentWindow()->MenuBarRect();
         const float button_w = 46.0f * dpi_scale_;
         const float buttons_x = bar.Max.x - (button_w * 3.0f);
-        caption_ = {static_cast<LONG>(ImGui::GetCursorScreenPos().x), static_cast<LONG>(bar.Min.y),
-                    static_cast<LONG>(buttons_x), static_cast<LONG>(bar.Max.y)};
+        caption_ = {.left = static_cast<LONG>(ImGui::GetCursorScreenPos().x),
+                    .top = static_cast<LONG>(bar.Min.y),
+                    .right = static_cast<LONG>(buttons_x),
+                    .bottom = static_cast<LONG>(bar.Max.y)};
 
         ImDrawList* dl = ImGui::GetWindowDrawList();
         const ImVec2 title_size = ImGui::CalcTextSize(title_utf8_.c_str());
@@ -757,11 +758,11 @@ namespace simple_notepad
             case 1:
                 if (zoomed)
                 {
-                    dl->AddRect({c.x - g, c.y - g + 2 * t}, {c.x + g - 2 * t, c.y + g}, ink, 0.0f, 0, t);
-                    dl->AddPolyline(std::array{ImVec2(c.x - g + 2 * t, c.y - g + 2 * t),
-                                               ImVec2(c.x - g + 2 * t, c.y - g), ImVec2(c.x + g, c.y - g),
-                                               ImVec2(c.x + g, c.y + g - 2 * t),
-                                               ImVec2(c.x + g - 2 * t, c.y + g - 2 * t)}
+                    dl->AddRect({c.x - g, c.y - g + (2 * t)}, {c.x + g - (2 * t), c.y + g}, ink, 0.0f, 0, t);
+                    dl->AddPolyline(std::array{ImVec2(c.x - g + (2 * t), c.y - g + (2 * t)),
+                                               ImVec2(c.x - g + (2 * t), c.y - g), ImVec2(c.x + g, c.y - g),
+                                               ImVec2(c.x + g, c.y + g - (2 * t)),
+                                               ImVec2(c.x + g - (2 * t), c.y + g - (2 * t))}
                                         .data(),
                                     5, ink, 0, t);
                 }
@@ -1130,7 +1131,7 @@ namespace simple_notepad
         }
         try
         {
-            text_file out{editor_.text(), doc_.encoding, doc_.crlf};
+            const text_file out{.text = editor_.text(), .encoding = doc_.encoding, .crlf = doc_.crlf};
             out.save(path_);
             saved_state_ = editor_.state();
             format_changed_ = false;
@@ -1220,7 +1221,7 @@ namespace simple_notepad
             return;
         }
         result.append(text, from);
-        editor_.replace_all(std::move(result));
+        editor_.replace_all(result);
         show_toast(std::format("Replaced {} occurrence{} (Ctrl+Z to undo)", replaced, replaced == 1 ? "" : "s"));
     }
 
