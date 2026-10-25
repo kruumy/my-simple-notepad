@@ -3,11 +3,13 @@
 #define IMGUI_DEFINE_MATH_OPERATORS
 #include "imgui.h"
 #include "imgui_internal.h"
+#include "motion.h"
 #include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <format>
 #include <numbers>
+#include <tuple>
 
 namespace simple_notepad
 {
@@ -28,12 +30,7 @@ namespace simple_notepad
     constexpr double FADE_SECONDS = 0.22;
     constexpr float FADE_RISE = 4.0f; // new characters float up into place by this many pixels
     constexpr size_t MAX_FADE_BYTES = 4096;
-
-    static float approach(float current, float target, float speed)
-    {
-        const float next = current + ((target - current) * (1.0f - std::exp(-speed * ImGui::GetIO().DeltaTime)));
-        return std::abs(target - next) < 0.5f ? target : next;
-    }
+    constexpr float PIXEL_SNAP = 0.5f;
 
     // 0 space, 1 word, 2 punctuation, 3 newline
     static int char_class(char c)
@@ -265,6 +262,13 @@ namespace simple_notepad
             line_start = fresh.back().end + 1;
         }
         const int line_delta = line - old_last_line;
+        const bool unwrapped = layout_wrap_width_ < 0.0f;
+        const float removed_width =
+            unwrapped ? std::ranges::max(std::ranges::subrange(rows_.begin() + r0, rows_.begin() + r1 + 1), {},
+                                         &row::width)
+                            .width
+                      : 0.0f;
+        const float fresh_width = unwrapped ? std::ranges::max(fresh, {}, &row::width).width : 0.0f;
         rows_.erase(rows_.begin() + r0, rows_.begin() + r1 + 1);
         rows_.insert(rows_.begin() + r0, fresh.begin(), fresh.end());
         std::for_each(rows_.begin() + r0 + static_cast<int>(fresh.size()), rows_.end(), [&](row& r) {
@@ -273,7 +277,15 @@ namespace simple_notepad
             r.line += line_delta;
         });
         line_count_ += line_delta;
-        update_content_width();
+        // only a full rescan finds the next widest row once the widest one shrinks
+        if (!unwrapped || fresh_width >= content_width_)
+        {
+            content_width_ = unwrapped ? fresh_width : layout_wrap_width_;
+        }
+        else if (removed_width >= content_width_)
+        {
+            update_content_width();
+        }
     }
 
     void editor::update_content_width()
@@ -462,7 +474,7 @@ namespace simple_notepad
             undo_.push_back({pos, text_.substr(pos, remove), std::string(insert), caret_, anchor_, kind, now, id});
             if (undo_.size() > MAX_UNDO)
             {
-                undo_.erase(undo_.begin());
+                undo_.pop_front();
             }
         }
         redo_.clear();
@@ -893,8 +905,8 @@ namespace simple_notepad
             target_y_ = std::clamp(target_y_, 0.0f, std::max(0.0f, content.y - view_height_));
         };
         clamp_targets();
-        scroll_x_ = v.wrap ? 0.0f : approach(scroll_x_, target_x_, SCROLL_SPEED);
-        scroll_y_ = approach(scroll_y_, target_y_, SCROLL_SPEED);
+        scroll_x_ = v.wrap ? 0.0f : motion::approach(scroll_x_, target_x_, SCROLL_SPEED, PIXEL_SNAP);
+        scroll_y_ = motion::approach(scroll_y_, target_y_, SCROLL_SPEED, PIXEL_SNAP);
 
         ImGui::SetCursorScreenPos({p0.x + gutter_width, p0.y});
         ImGui::SetNextWindowContentSize(content_size());
@@ -1005,7 +1017,7 @@ namespace simple_notepad
         const double now = ImGui::GetTime();
         std::erase_if(fades_, [&](const fade& f) { return now - f.time >= FADE_SECONDS; });
 
-        // draws [p, q) starting at x, splitting it where recently typed characters fade and rise in
+        // draws [p, q) from x and returns the end x, split where recently typed characters fade and rise in
         const auto draw_run = [&](int p, int q, float x, float y) {
             while (p < q)
             {
@@ -1023,12 +1035,13 @@ namespace simple_notepad
                         cut = std::min(cut, f.start);
                     }
                 }
-                const float e = 1.0f - ((1.0f - t) * (1.0f - t) * (1.0f - t)); // ease out
+                const float e = motion::ease_out(t);
                 dl->AddText({x, y + text_offset + ((1.0f - e) * FADE_RISE * dpi_)},
                             t >= 1.0f ? text_col : ImGui::GetColorU32(ImGuiCol_Text, e), s + p, s + cut);
                 x += measure(p, cut);
                 p = cut;
             }
+            return x;
         };
 
         if (focused_ && lo == hi)
@@ -1060,12 +1073,11 @@ namespace simple_notepad
             // raw loop: draws tab-separated runs so tab stops line up
             for (int p = w.start; p < w.end;)
             {
-                const size_t tab = text_.find('\t', p);
-                const int q = tab == std::string::npos ? w.end : std::min(static_cast<int>(tab), w.end);
+                const size_t tab = std::string_view(text_).substr(p, w.end - p).find('\t');
+                const int q = tab == std::string_view::npos ? w.end : p + static_cast<int>(tab);
                 if (q > p)
                 {
-                    draw_run(p, q, origin_x + x, y);
-                    x += measure(p, q);
+                    x = draw_run(p, q, origin_x + x, y) - origin_x;
                 }
                 if (q < w.end)
                 {
@@ -1088,8 +1100,8 @@ namespace simple_notepad
             caret_y_ = target_y;
             snap_caret_ = false;
         }
-        caret_x_ = approach(caret_x_, target_x, CARET_SPEED);
-        caret_y_ = approach(caret_y_, target_y, CARET_SPEED);
+        caret_x_ = motion::approach(caret_x_, target_x, CARET_SPEED, PIXEL_SNAP);
+        caret_y_ = motion::approach(caret_y_, target_y, CARET_SPEED, PIXEL_SNAP);
         caret_settled_ = caret_x_ == target_x && caret_y_ == target_y;
         if (!focused_)
         {
@@ -1132,7 +1144,8 @@ namespace simple_notepad
                 continue;
             }
             const char* const end = std::format_to_n(label.data(), label.size(), "{}", rows_[r].line + 1).out;
-            const float w = ImGui::CalcTextSize(label.data(), end).x;
+            // consolas and both fallbacks (segoe ui, proggy clean) have tabular digits
+            const float w = static_cast<float>(end - label.data()) * ascii_advance_['0'];
             dl->AddText({x + width - (PAD * 0.75f * dpi_) - w, origin_y + (static_cast<float>(r) * lh) + text_offset},
                         rows_[r].line == caret_line ? bright : dim, label.data(), end);
         }
@@ -1157,11 +1170,14 @@ namespace simple_notepad
         const float view_h = view_height_ / line_height_ * row_h;
 
         // off-frame teardrop, sized by last frame's animation so it can be grabbed before the minimap
-        const float drop_r = 4.5f * dpi_ * teardrop_;
-        // slides in from the edge while it grows
-        const ImVec2 drop_tip{x + width - (2.0f * dpi_) + ((1.0f - teardrop_) * 6.0f * dpi_),
-                              view_top + (std::min(view_h, height_) * 0.5f)};
-        const ImVec2 drop_c{drop_tip.x - (drop_r * 2.2f), drop_tip.y};
+        // a lambda so the draw below picks up this frame's updated teardrop_; slides in from the edge while it grows
+        const float drop_y = view_top + (std::min(view_h, height_) * 0.5f);
+        const auto drop_shape = [&] {
+            const float r = 4.5f * dpi_ * teardrop_;
+            const ImVec2 tip{x + width - (2.0f * dpi_) + ((1.0f - teardrop_) * 6.0f * dpi_), drop_y};
+            return std::tuple{r, tip, ImVec2{tip.x - (r * 2.2f), tip.y}};
+        };
+        const auto [drop_r, drop_tip, drop_c] = drop_shape();
         bool drop_held = false;
         if (teardrop_ > 0.0f)
         {
@@ -1275,15 +1291,12 @@ namespace simple_notepad
                     ImDrawFlags_None, dpi_);
         // the view is almost entirely past the minimap's right edge (long lines): a teardrop points toward it
         const bool off_frame = x + width - view_left < (view_right - view_left) * 0.01f;
-        // approach snaps within 0.5, so ease in percent
-        teardrop_ = approach(teardrop_ * 100.0f, off_frame ? 100.0f : 0.0f, TEARDROP_SPEED) / 100.0f;
+        teardrop_ = motion::approach(teardrop_, off_frame ? 1.0f : 0.0f, TEARDROP_SPEED, 0.005f);
         // held, it stays up even if the view comes back on screen mid-drag
         teardrop_ = drop_held ? 1.0f : teardrop_;
         if (teardrop_ > 0.0f)
         {
-            const float r = 4.5f * dpi_ * teardrop_;
-            const ImVec2 tip{x + width - (2.0f * dpi_) + ((1.0f - teardrop_) * 6.0f * dpi_), drop_tip.y};
-            const ImVec2 c{tip.x - (r * 2.2f), tip.y};
+            const auto [r, tip, c] = drop_shape();
             // one outline (the far side of the circle, then out to the tip along its tangents) so no
             // overlapping shapes show through when it fades
             const float tangent = std::acos(1.0f / 2.2f);

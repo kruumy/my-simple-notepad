@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <deque>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -119,7 +120,7 @@ namespace simple_notepad
         select_mode mode_ = select_mode::chars;
         std::pair<int, int> drag_origin_{0, 0};
 
-        std::vector<edit> undo_;
+        std::deque<edit> undo_; // drops its oldest step once full
         std::vector<edit> redo_;
         std::uint64_t next_id_ = 1;
 
