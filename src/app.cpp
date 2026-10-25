@@ -7,8 +7,8 @@
 #include "imgui_impl_dx11.h"
 #include "imgui_impl_win32.h"
 #include "imgui_internal.h"
-#include "motion.h"
 #include "misc/cpp/imgui_stdlib.h"
+#include "motion.h"
 #include <windows.h>
 #include <algorithm>
 #include <array>
@@ -115,9 +115,9 @@ namespace simple_notepad
 
         hwnd_ = CreateWindowExW(WS_EX_ACCEPTFILES, wc.lpszClassName, L"Simple Notepad", WS_OVERLAPPEDWINDOW,
                                 CW_USEDEFAULT, CW_USEDEFAULT, 960, 640, nullptr, nullptr, wc.hInstance, this);
-        if (hwnd_ == nullptr || !create_device())
+        if (hwnd_ == nullptr)
         {
-            MessageBoxW(nullptr, L"Could not create a Direct3D 11 device.", L"Simple Notepad", MB_ICONERROR);
+            MessageBoxW(nullptr, L"Could not create the window.", L"Simple Notepad", MB_ICONERROR);
             return 1;
         }
 
@@ -125,6 +125,14 @@ namespace simple_notepad
         SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER);
         const BOOL dark = TRUE;
         DwmSetWindowAttribute(hwnd_, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &dark, sizeof(dark));
+        // the gpu driver takes ~200 ms to create a device, so show the empty window first; frames wait for ready_
+        ShowWindow(hwnd_, SW_SHOWNORMAL);
+        UpdateWindow(hwnd_); // paints the background brush now, as the loop is not pumping yet
+        if (!create_device())
+        {
+            MessageBoxW(nullptr, L"Could not create a Direct3D 11 device.", L"Simple Notepad", MB_ICONERROR);
+            return 1;
+        }
 
         IMGUI_CHECKVERSION();
         ImGui::CreateContext();
@@ -164,7 +172,6 @@ namespace simple_notepad
         }
         update_title();
         ready_ = true;
-        ShowWindow(hwnd_, SW_SHOWNORMAL);
 
         // event-driven loop: sleeps until input arrives, renders only while something changes
         while (running_)
