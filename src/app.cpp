@@ -106,7 +106,7 @@ namespace simple_notepad
             .cbSize = sizeof(WNDCLASSEXW),
             .lpfnWndProc = window_proc,
             .hInstance = GetModuleHandleW(nullptr),
-            .hIcon = LoadIconW(nullptr, IDI_APPLICATION),
+            .hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1)), // id from res/app.rc
             .hCursor = LoadCursorW(nullptr, IDC_ARROW),
             .hbrBackground = CreateSolidBrush(WINDOW_BRUSH),
             .lpszClassName = L"simple_notepad",

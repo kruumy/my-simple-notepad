@@ -13,6 +13,7 @@ add_executable(${PROJECT_NAME} WIN32
     "src/editor.cpp"
     "src/ini.cpp"
     "src/text_file.cpp"
+    "res/app.rc"
 )
 target_include_directories(${PROJECT_NAME} PRIVATE src)
 target_compile_definitions(${PROJECT_NAME} PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)

@@ -264,10 +264,10 @@ namespace simple_notepad
         const int line_delta = line - old_last_line;
         const bool unwrapped = layout_wrap_width_ < 0.0f;
         const float removed_width =
-            unwrapped ? std::ranges::max(std::ranges::subrange(rows_.begin() + r0, rows_.begin() + r1 + 1), {},
-                                         &row::width)
-                            .width
-                      : 0.0f;
+            unwrapped
+                ? std::ranges::max(std::ranges::subrange(rows_.begin() + r0, rows_.begin() + r1 + 1), {}, &row::width)
+                      .width
+                : 0.0f;
         const float fresh_width = unwrapped ? std::ranges::max(fresh, {}, &row::width).width : 0.0f;
         rows_.erase(rows_.begin() + r0, rows_.begin() + r1 + 1);
         rows_.insert(rows_.begin() + r0, fresh.begin(), fresh.end());
@@ -1302,7 +1302,7 @@ namespace simple_notepad
             const float tangent = std::acos(1.0f / 2.2f);
             dl->PathArcTo(c, r, tangent, (2.0f * std::numbers::pi_v<float>)-tangent);
             dl->PathLineTo(tip);
-            dl->PathFillConvex(ImGui::GetColorU32(ImGuiCol_Text, teardrop_));
+            dl->PathFillConvex(ImGui::GetColorU32(ImVec4{0.000f, 0.471f, 0.831f, teardrop_})); // logo blue
         }
         dl->PopClipRect();
     }
