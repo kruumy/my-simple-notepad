@@ -42,6 +42,12 @@ namespace simple_notepad
         [[nodiscard]] std::optional<size_t> search(size_t from, bool backward) const; // wraps around
         // index of the selected match (-1 when the selection is not one) and the match count
         [[nodiscard]] std::pair<int, int> match_status();
+        [[nodiscard]] bool matches_capped() const // more matches exist than match_status counted
+        {
+            return matches_capped_;
+        }
+        [[nodiscard]] bool selection_is_match() const;
+        [[nodiscard]] bool contains_needle(std::string_view s) const;
 
         [[nodiscard]] const std::string& text() const
         {
@@ -112,6 +118,7 @@ namespace simple_notepad
         bool needle_case_ = false;
         bool matches_dirty_ = false;
         bool show_matches_ = false;
+        bool matches_capped_ = false;
         std::vector<std::pair<int, int>> matches_; // sorted, non-overlapping byte ranges of needle_
         std::vector<row> rows_{{.start = 0, .end = 0, .line = 0, .first = true, .width = 0.0f}};
         int line_count_ = 1;
@@ -168,6 +175,7 @@ namespace simple_notepad
         void replace_text(int pos, int remove, std::string_view insert);
         void update_content_width();
         void find_matches();
+        [[nodiscard]] bool same_char(char a, char b) const; // honours needle_case_
         [[nodiscard]] int row_of(int pos) const;
         [[nodiscard]] float x_of(int pos) const;
         [[nodiscard]] int pos_at(int row_index, float x) const;

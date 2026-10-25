@@ -869,13 +869,16 @@ namespace simple_notepad
         {
             // jump to the first match from the selection's start, so typing more letters keeps the same one
             editor_.set_search(find_text_, match_case_);
-            select_match(static_cast<size_t>(editor_.selection().first), false);
+            if (editor_.match_status().second > 0) // the count already says "No results", so no toast per letter
+            {
+                select_match(static_cast<size_t>(editor_.selection().first), false);
+            }
         }
         if (!find_text_.empty())
         {
             // drawn inside the field's right end, like vs code, so the buttons never shift as it changes
             const auto [index, count] = editor_.match_status();
-            const std::string more = count == editor::MAX_MATCHES ? "+" : "";
+            const std::string more = editor_.matches_capped() ? "+" : "";
             std::string status = "No results";
             if (count > 0)
             {
@@ -884,9 +887,14 @@ namespace simple_notepad
             }
             const ImVec2 max = ImGui::GetItemRectMax();
             const ImVec2 size = ImGui::CalcTextSize(status.c_str());
-            ImGui::GetWindowDrawList()->AddText(
-                {max.x - size.x - style.FramePadding.x, max.y - style.FramePadding.y - size.y},
-                ImGui::GetColorU32(ImGuiCol_TextDisabled), status.c_str());
+            // hidden once the typed text reaches it, rather than drawn over it
+            const float room = ImGui::GetItemRectSize().x - ImGui::CalcTextSize(find_text_.c_str()).x;
+            if (room >= size.x + (style.FramePadding.x * 3))
+            {
+                ImGui::GetWindowDrawList()->AddText(
+                    {max.x - size.x - style.FramePadding.x, max.y - style.FramePadding.y - size.y},
+                    ImGui::GetColorU32(ImGuiCol_TextDisabled), status.c_str());
+            }
         }
         if (ImGui::IsItemDeactivated() && ImGui::IsKeyPressed(ImGuiKey_Escape))
         {
@@ -906,10 +914,7 @@ namespace simple_notepad
         }
         ImGui::SetItemTooltip("Next (F3)");
         ImGui::SameLine();
-        if (ImGui::Checkbox("Match case", &match_case_))
-        {
-            editor_.set_search(find_text_, match_case_);
-        }
+        ImGui::Checkbox("Match case", &match_case_);
         ImGui::SameLine();
         if (ImGui::Button(show_replace_ ? "Hide replace" : "Replace..."))
         {
@@ -925,6 +930,9 @@ namespace simple_notepad
         if (replace_eased > 0.0f)
         {
             ImGui::PushStyleVar(ImGuiStyleVar_Alpha, style.Alpha * replace_eased);
+            // a fading-out row stays visible but takes no clicks or enter; full DisabledAlpha so it does not dim
+            ImGui::PushStyleVar(ImGuiStyleVar_DisabledAlpha, 1.0f);
+            ImGui::BeginDisabled(!show_replace_);
             ImGui::SetNextItemWidth(field);
             if (ImGui::InputTextWithHint("##replace_text", "Replace with", &replace_text_,
                                          ImGuiInputTextFlags_EnterReturnsTrue))
@@ -943,7 +951,8 @@ namespace simple_notepad
             {
                 replace_all();
             }
-            ImGui::PopStyleVar();
+            ImGui::EndDisabled();
+            ImGui::PopStyleVar(2);
         }
         ImGui::EndChild();
         // the item gap below the bar shrinks with it, else the editor hops by that gap when the bar goes
@@ -1206,12 +1215,16 @@ namespace simple_notepad
 
     bool app::select_match(size_t from, bool backward)
     {
+        // synced here, not only per frame, so a search right after an edit of the find text uses it
+        editor_.set_search(find_text_, match_case_);
         const auto found = editor_.search(from, backward);
-        if (found)
+        if (!found)
         {
-            editor_.select(static_cast<int>(*found), static_cast<int>(*found + find_text_.size()));
+            show_toast(std::format("\"{}\" not found", find_text_));
+            return false;
         }
-        return found.has_value();
+        editor_.select(static_cast<int>(*found), static_cast<int>(*found + find_text_.size()));
+        return true;
     }
 
     void app::find_next(bool backward)
@@ -1222,13 +1235,11 @@ namespace simple_notepad
             return;
         }
         const auto [lo, hi] = editor_.selection();
-        if (!select_match(static_cast<size_t>(backward ? lo : hi), backward))
+        if (select_match(static_cast<size_t>(backward ? lo : hi), backward))
         {
-            show_toast(std::format("\"{}\" not found", find_text_));
-            return;
+            // only while the editor has focus: enter there keeps jumping, while the find bar handles its own enter
+            find_cycling_ = editor_.focused();
         }
-        // only while the editor has focus: enter there keeps jumping, while the find bar handles its own enter
-        find_cycling_ = editor_.focused();
     }
 
     void app::replace_next()
@@ -1238,16 +1249,23 @@ namespace simple_notepad
             return;
         }
         // the selected match is replaced, then the next one selected; focus stays in the find bar for another enter
-        const auto [lo, hi] = editor_.selection();
-        if (editor_.search(static_cast<size_t>(lo), false) == static_cast<size_t>(lo) &&
-            std::cmp_equal(hi - lo, find_text_.size()))
+        editor_.set_search(find_text_, match_case_);
+        const bool replaced = editor_.selection_is_match();
+        if (replaced)
         {
             editor_.insert(replace_text_);
         }
-        if (!select_match(static_cast<size_t>(editor_.selection().second), false))
+        const auto from = static_cast<size_t>(editor_.selection().second);
+        // a replacement holding the needle would be found again after wrapping and replaced over and over
+        if (replaced && editor_.contains_needle(replace_text_))
         {
-            show_toast(std::format("\"{}\" not found", find_text_));
+            if (const auto next = editor_.search(from, false); next && *next < from)
+            {
+                show_toast("Reached the end of the file");
+                return;
+            }
         }
+        select_match(from, false);
     }
 
     void app::replace_all()
@@ -1256,6 +1274,7 @@ namespace simple_notepad
         {
             return;
         }
+        editor_.set_search(find_text_, match_case_);
         const std::string& text = editor_.text();
         std::string result;
         result.reserve(text.size());

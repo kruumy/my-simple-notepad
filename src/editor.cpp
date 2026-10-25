@@ -122,12 +122,30 @@ namespace simple_notepad
         }
     }
 
+    bool editor::same_char(char a, char b) const
+    {
+        const auto fold = [](char c) { return c >= 'A' && c <= 'Z' ? static_cast<char>(c + 32) : c; };
+        return needle_case_ ? a == b : fold(a) == fold(b);
+    }
+
+    bool editor::selection_is_match() const
+    {
+        const auto [lo, hi] = selection();
+        const auto equal = [this](char a, char b) { return same_char(a, b); };
+        return !needle_.empty() && std::ranges::equal(std::string_view(text_).substr(lo, hi - lo), needle_, equal);
+    }
+
+    bool editor::contains_needle(std::string_view s) const
+    {
+        const auto equal = [this](char a, char b) { return same_char(a, b); };
+        return !needle_.empty() && !std::ranges::search(s, needle_, equal).empty();
+    }
+
     std::optional<size_t> editor::search(size_t from, bool backward) const
     {
         const std::string_view text = text_;
         const std::string_view needle = needle_;
-        const auto fold = [](char c) { return c >= 'A' && c <= 'Z' ? static_cast<char>(c + 32) : c; };
-        const auto equal = [&](char a, char b) { return needle_case_ ? a == b : fold(a) == fold(b); };
+        const auto equal = [this](char a, char b) { return same_char(a, b); };
 
         if (backward)
         {
@@ -345,12 +363,18 @@ namespace simple_notepad
     {
         matches_dirty_ = false;
         matches_.clear();
+        matches_capped_ = false;
         // raw loop: search() wraps around, so stop once a hit lands before the cursor
-        for (size_t from = 0; std::cmp_less(matches_.size(), MAX_MATCHES);)
+        for (size_t from = 0;;)
         {
             const auto hit = search(from, false);
             if (!hit || *hit < from)
             {
+                break;
+            }
+            if (std::cmp_equal(matches_.size(), MAX_MATCHES))
+            {
+                matches_capped_ = true; // found one more than it keeps
                 break;
             }
             matches_.emplace_back(static_cast<int>(*hit), static_cast<int>(*hit + needle_.size()));
