@@ -1357,7 +1357,14 @@ namespace simple_notepad
 
     void app::format_json()
     {
-        std::string result = pretty_json(editor_.text());
+        const std::string& text = editor_.text();
+        const size_t first = text.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos || (text[first] != '{' && text[first] != '['))
+        {
+            show_toast("Not JSON: the document must start with { or [");
+            return;
+        }
+        std::string result = pretty_json(text);
         if (result.empty())
         {
             show_toast("Not valid JSON: brackets or quotes don't balance");
@@ -1400,8 +1407,17 @@ namespace simple_notepad
             case ' ':
             case '\t':
             case '\r':
-            case '\n':
+            case '\n': {
+                // dropping whitespace between two values would merge them, so reject instead
+                const size_t next = text.find_first_not_of(" \t\r\n", i + 1);
+                if (!out.empty() && next != std::string_view::npos &&
+                    std::string_view("{[,: \n").find(out.back()) == std::string_view::npos &&
+                    std::string_view("}],:").find(text[next]) == std::string_view::npos)
+                {
+                    return {};
+                }
                 break;
+            }
             case '"':
                 in_string = true;
                 out += c;
