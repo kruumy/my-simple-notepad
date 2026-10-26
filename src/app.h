@@ -64,7 +64,7 @@ namespace simple_notepad
         HWND hwnd_ = nullptr;
         Microsoft::WRL::ComPtr<ID3D11Device> device_;
         Microsoft::WRL::ComPtr<ID3D11DeviceContext> context_;
-        Microsoft::WRL::ComPtr<IDXGISwapChain> swap_chain_;
+        Microsoft::WRL::ComPtr<IDXGISwapChain1> swap_chain_;
         HANDLE frame_ready_ = nullptr; // signalled when the gpu can take another frame
         std::vector<char> presented_;  // draw data of the frame on screen, to skip identical frames
         Microsoft::WRL::ComPtr<ID3D11RenderTargetView> target_;

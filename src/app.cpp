@@ -268,26 +268,37 @@ namespace simple_notepad
 
     bool app::create_device()
     {
-        DXGI_SWAP_CHAIN_DESC sd{};
-        sd.BufferCount = 2;
-        sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-        sd.OutputWindow = hwnd_;
-        sd.SampleDesc.Count = 1;
-        sd.Windowed = TRUE;
-        sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-        sd.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
-
         constexpr std::array levels{D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0};
         const auto create = [&](D3D_DRIVER_TYPE type) {
-            return D3D11CreateDeviceAndSwapChain(nullptr, type, nullptr, 0, levels.data(),
-                                                 static_cast<UINT>(levels.size()), D3D11_SDK_VERSION, &sd, &swap_chain_,
-                                                 &device_, nullptr, &context_);
+            return D3D11CreateDevice(nullptr, type, nullptr, 0, levels.data(), static_cast<UINT>(levels.size()),
+                                     D3D11_SDK_VERSION, &device_, nullptr, &context_);
         };
         if (FAILED(create(D3D_DRIVER_TYPE_HARDWARE)) && FAILED(create(D3D_DRIVER_TYPE_WARP)))
         {
             return false;
         }
+        Microsoft::WRL::ComPtr<IDXGIDevice> dxgi_device;
+        Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
+        Microsoft::WRL::ComPtr<IDXGIFactory2> factory;
+        if (FAILED(device_.As(&dxgi_device)) || FAILED(dxgi_device->GetAdapter(&adapter)) ||
+            FAILED(adapter->GetParent(IID_PPV_ARGS(&factory))))
+        {
+            return false;
+        }
+        const DXGI_SWAP_CHAIN_DESC1 sd{
+            .Format = DXGI_FORMAT_R8G8B8A8_UNORM,
+            .SampleDesc = {.Count = 1},
+            .BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT,
+            .BufferCount = 2,
+            .Scaling = DXGI_SCALING_NONE, // shown unstretched from the top left, so buffers may outsize the window
+            .SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD,
+            .Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
+        };
+        if (FAILED(factory->CreateSwapChainForHwnd(device_.Get(), hwnd_, &sd, nullptr, nullptr, &swap_chain_)))
+        {
+            return false;
+        }
+        factory->MakeWindowAssociation(hwnd_, DXGI_MWA_NO_ALT_ENTER); // a text editor has no exclusive fullscreen
         create_target();
         // the loop sleeps on this handle until the gpu can take a frame, instead of blocking inside present
         Microsoft::WRL::ComPtr<IDXGISwapChain2> chain2;
@@ -309,6 +320,27 @@ namespace simple_notepad
     void app::resize(UINT width, UINT height)
     {
         if (!swap_chain_ || width == 0 || height == 0)
+        {
+            return;
+        }
+        DXGI_SWAP_CHAIN_DESC1 buffers{};
+        swap_chain_->GetDesc1(&buffers);
+        // a drag keeps roomy buffers and draws in their top left, as reallocating costs more than a frame
+        if (sizing_)
+        {
+            if (width <= buffers.Width && height <= buffers.Height)
+            {
+                return;
+            }
+            MONITORINFO monitor{.cbSize = sizeof(MONITORINFO)};
+            GetMonitorInfoW(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST), &monitor);
+            // half again over the window, so growing past the monitor still reallocates only now and then
+            width = std::max(
+                {width + (width / 2), buffers.Width, static_cast<UINT>(monitor.rcWork.right - monitor.rcWork.left)});
+            height = std::max(
+                {height + (height / 2), buffers.Height, static_cast<UINT>(monitor.rcWork.bottom - monitor.rcWork.top)});
+        }
+        else if (width == buffers.Width && height == buffers.Height)
         {
             return;
         }
@@ -391,6 +423,16 @@ namespace simple_notepad
         case WM_ENTERSIZEMOVE:
         case WM_EXITSIZEMOVE:
             sizing_ = msg == WM_ENTERSIZEMOVE; // rewrapping a big file every frame of a drag would stall it
+            if (!sizing_)
+            {
+                RECT client{};
+                GetClientRect(hwnd_, &client);
+                resize(static_cast<UINT>(client.right), static_cast<UINT>(client.bottom)); // frees the drag's slack
+                if (ready_ && !in_frame_)
+                {
+                    frame(); // the exact buffers start undefined
+                }
+            }
             return 0;
         case WM_SIZE:
             if (wparam != SIZE_MINIMIZED)
