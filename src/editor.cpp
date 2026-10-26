@@ -8,7 +8,9 @@
 #include <cctype>
 #include <cmath>
 #include <format>
+#include <limits>
 #include <numbers>
+#include <span>
 #include <tuple>
 
 namespace simple_notepad
@@ -31,8 +33,21 @@ namespace simple_notepad
     constexpr float FADE_RISE = 4.0f; // new characters float up into place by this many pixels
     constexpr size_t MAX_FADE_BYTES = 4096;
     constexpr float PIXEL_SNAP = 0.5f;
+    constexpr int MAX_ROW_BYTES = 10000;                    // unwrapped lines break here too, like windows notepad
     constexpr ImU32 MATCH_COLOR = IM_COL32(234, 92, 0, 85); // vs code's find highlight
     constexpr ImU32 MATCH_MARK_COLOR = IM_COL32(209, 134, 22, 255);
+    constexpr int MAX_HIGHLIGHT_BYTES = 200 * 1024 * 1024; // notepad++'s default large file restriction
+    // vs code dark modern, indexed by syntax::token
+    constexpr std::array<ImU32, 8> TOKEN_COLORS = {
+        IM_COL32(106, 153, 85, 255),  // comment
+        IM_COL32(206, 145, 120, 255), // string
+        IM_COL32(181, 206, 168, 255), // number
+        IM_COL32(86, 156, 214, 255),  // keyword
+        IM_COL32(220, 220, 170, 255), // function
+        IM_COL32(86, 156, 214, 255),  // heading
+        IM_COL32(197, 134, 192, 255), // emphasis
+        IM_COL32(78, 201, 176, 255),  // link
+    };
 
     // 0 space, 1 word, 2 punctuation, 3 newline
     static int char_class(char c)
@@ -56,6 +71,7 @@ namespace simple_notepad
         text_ = std::move(text);
         fades_.clear();
         matches_dirty_ = true;
+        spans_dirty_ = true;
         undo_.clear();
         redo_.clear();
         caret_ = anchor_ = 0;
@@ -119,6 +135,15 @@ namespace simple_notepad
             needle_ = needle;
             needle_case_ = match_case;
             matches_dirty_ = true;
+        }
+    }
+
+    void editor::set_language(const syntax::language* lang)
+    {
+        if (lang != language_)
+        {
+            language_ = lang;
+            spans_dirty_ = true;
         }
     }
 
@@ -214,6 +239,13 @@ namespace simple_notepad
         // raw loop: utf-8 decoding steps a variable number of bytes
         for (int p = start; p < end;)
         {
+            const auto b = static_cast<unsigned char>(s[p]);
+            if (b < 128 && b != '\t')
+            {
+                x += ascii_advance_[b]; // most text: skips the decoder, same result as advance()
+                ++p;
+                continue;
+            }
             unsigned int c = 0;
             p += ImTextCharFromUtf8(&c, s + p, s + end);
             x += advance(c, x);
@@ -228,8 +260,21 @@ namespace simple_notepad
         const int line_end = found == std::string::npos ? static_cast<int>(text_.size()) : static_cast<int>(found);
         if (layout_wrap_width_ < 0.0f)
         {
-            out.push_back({line_start, line_end, line, true, measure(line_start, line_end)});
-            return;
+            // huge lines still split into rows: float x loses whole pixels far out, and short rows stay cheap
+            for (int row_start = line_start;;) // raw loop: one row per MAX_ROW_BYTES
+            {
+                int end = std::min(line_end, row_start + MAX_ROW_BYTES);
+                while (end < line_end && (text_[end] & 0xC0) == 0x80) // whole characters only
+                {
+                    ++end;
+                }
+                out.push_back({row_start, end, line, row_start == line_start, measure(row_start, end)});
+                if (end == line_end)
+                {
+                    return;
+                }
+                row_start = end;
+            }
         }
         const char* s = text_.data();
         int row_start = line_start;
@@ -239,8 +284,8 @@ namespace simple_notepad
         // raw loop: greedily breaks the line at the last space that fits
         for (int p = line_start; p < line_end;)
         {
-            unsigned int c = 0;
-            const int len = ImTextCharFromUtf8(&c, s + p, s + line_end);
+            unsigned int c = static_cast<unsigned char>(s[p]);
+            const int len = c < 128 ? 1 : ImTextCharFromUtf8(&c, s + p, s + line_end); // ascii skips the decoder
             float w = advance(c, x);
             if (x + w > layout_wrap_width_ && p > row_start)
             {
@@ -290,6 +335,18 @@ namespace simple_notepad
             return static_cast<int>(std::ranges::count_if(s, [](char c) { return (c & 0xC0) != 0x80; }));
         };
         matches_dirty_ = true;
+        const int new_size = static_cast<int>(text_.size() + insert.size()) - remove;
+        if (std::max(static_cast<int>(text_.size()), new_size) > MAX_HIGHLIGHT_BYTES)
+        {
+            spans_dirty_ = true; // crossing the limit either way needs a full pass
+        }
+        // widen the range edited since the last scan; bytes after it only shifted
+        const int inserted_end = pos + static_cast<int>(insert.size());
+        edited_.new_end = edited_.start < 0 || edited_.new_end < pos + remove
+                              ? inserted_end
+                              : edited_.new_end + inserted_end - (pos + remove);
+        edited_.start = edited_.start < 0 ? pos : std::min(edited_.start, pos);
+        edited_.old_end = edited_.new_end - (new_size - scanned_size_);
         std::erase_if(fades_, [&](const fade& f) { return f.end > pos && f.start < pos + remove; });
         std::ranges::for_each(fades_, [&](fade& f) {
             if (f.start >= pos)
@@ -340,8 +397,17 @@ namespace simple_notepad
                       .width
                 : 0.0f;
         const float fresh_width = unwrapped ? std::ranges::max(fresh, {}, &row::width).width : 0.0f;
-        rows_.erase(rows_.begin() + r0, rows_.begin() + r1 + 1);
-        rows_.insert(rows_.begin() + r0, fresh.begin(), fresh.end());
+        // typing inside a line keeps its row count, so the rows after it needn't move in memory
+        const auto old_count = static_cast<size_t>(r1 - r0 + 1);
+        if (fresh.size() > old_count)
+        {
+            rows_.insert(rows_.begin() + r1 + 1, fresh.size() - old_count, row{});
+        }
+        else if (fresh.size() < old_count)
+        {
+            rows_.erase(rows_.begin() + r0 + static_cast<int>(fresh.size()), rows_.begin() + r1 + 1);
+        }
+        std::ranges::copy(fresh, rows_.begin() + r0);
         std::for_each(rows_.begin() + r0 + static_cast<int>(fresh.size()), rows_.end(), [&](row& r) {
             r.start += delta;
             r.end += delta;
@@ -534,6 +600,10 @@ namespace simple_notepad
 
     void editor::apply(int pos, int remove, std::string_view insert, merge kind)
     {
+        if (text_.size() - remove + insert.size() > static_cast<size_t>(std::numeric_limits<int>::max()))
+        {
+            return; // offsets are int: refusing the edit beats corrupting the text
+        }
         const double now = ImGui::GetTime();
         const std::uint64_t id = next_id_++;
         bool merged = false;
@@ -917,7 +987,10 @@ namespace simple_notepad
                 anchor_x = x_of(caret_) + old_pad - scroll_x_;
                 anchor_y = (static_cast<float>(row_of(caret_)) * line_height_) + old_pad - scroll_y_;
             }
+            zoom_x_ = view_left_ + anchor_x;
+            zoom_y_ = top_ + anchor_y;
         }
+        zoom_scale_ = v.scale;
 
         line_height_ = std::round(font_size * LINE_SPACING);
         if (ImFontBaked* baked = ImGui::GetFontBaked(); baked != baked_ || layout_size_ != font_size)
@@ -1081,11 +1154,57 @@ namespace simple_notepad
         {
             find_matches();
         }
+        const bool highlight = language_ != nullptr && std::cmp_less_equal(text_.size(), MAX_HIGHLIGHT_BYTES);
+        if (spans_dirty_)
+        {
+            spans_ = highlight ? syntax::scan(*language_, text_) : std::vector<syntax::span>{};
+        }
+        else if (highlight && edited_.start >= 0)
+        {
+            syntax::rescan(*language_, text_, edited_, spans_);
+        }
+        spans_dirty_ = false;
+        edited_.start = -1;
+        scanned_size_ = static_cast<int>(text_.size());
+        // eased zoom: drawn under a widened clip so text scaling into view isn't culled, then the clip is restored
+        const auto scale_drawn = [&](ImDrawList* dl, std::pair<int, int> since, ImVec2 pivot, ImVec4 clip) {
+            std::ranges::for_each(std::span(dl->VtxBuffer.Data, dl->VtxBuffer.Size).subspan(since.first),
+                                  [&](ImDrawVert& vert) { vert.pos = pivot + ((vert.pos - pivot) * zoom_scale_); });
+            std::ranges::for_each(
+                std::span(dl->CmdBuffer.Data, dl->CmdBuffer.Size).subspan(std::max(since.second - 1, 0)),
+                [&](ImDrawCmd& cmd) {
+                    // the last command still has the outer clip and takes whatever is drawn next
+                    if (cmd.ClipRect != dl->_CmdHeader.ClipRect)
+                    {
+                        cmd.ClipRect = clip;
+                    }
+                });
+        };
+        const ImVec2 zoom_at{zoom_x_, zoom_y_};
+        ImDrawList* text_dl = ImGui::GetWindowDrawList();
+        const std::pair text_since{text_dl->VtxBuffer.Size, text_dl->CmdBuffer.Size};
+        if (zoom_scale_ != 1.0f)
+        {
+            text_dl->PushClipRect(unscale(window->InnerClipRect.Min), unscale(window->InnerClipRect.Max));
+        }
         draw_text(origin_x, origin_y);
+        if (zoom_scale_ != 1.0f)
+        {
+            text_dl->PopClipRect();
+            scale_drawn(text_dl, text_since, zoom_at, window->InnerClipRect.ToVec4());
+        }
         ImGui::EndChild();
         ImGui::PopStyleVar();
 
+        ImDrawList* gutter_dl = ImGui::GetWindowDrawList();
+        const std::pair gutter_since{gutter_dl->VtxBuffer.Size, gutter_dl->CmdBuffer.Size};
         draw_gutter(p0.x, gutter_width, origin_y);
+        if (zoom_scale_ != 1.0f)
+        {
+            // numbers stay right-aligned, so they scale about the gutter's right edge
+            scale_drawn(gutter_dl, gutter_since, {p0.x + gutter_width - (PAD * 0.75f * dpi_), zoom_at.y},
+                        {p0.x, top_, p0.x + gutter_width, top_ + height_});
+        }
         if (minimap_width > 0.0f)
         {
             draw_minimap(p0.x + gutter_width + text_width, minimap_width);
@@ -1099,10 +1218,18 @@ namespace simple_notepad
         ImGui::PopFont();
     }
 
+    // the layout-space point an eased zoom draws at screen point p
+    ImVec2 editor::unscale(ImVec2 p) const
+    {
+        const ImVec2 at{zoom_x_, zoom_y_};
+        return at + ((p - at) / zoom_scale_);
+    }
+
     void editor::draw_text(float origin_x, float origin_y)
     {
         ImDrawList* dl = ImGui::GetWindowDrawList();
-        const ImRect inner = ImGui::GetCurrentWindow()->InnerRect;
+        const ImRect view = ImGui::GetCurrentWindow()->InnerRect;
+        const ImRect inner{unscale(view.Min), unscale(view.Max)}; // the part of the layout that lands on the view
         const float lh = line_height_;
         const int last_row = static_cast<int>(rows_.size()) - 1;
         const int first = std::clamp(static_cast<int>((inner.Min.y - origin_y) / lh), 0, last_row);
@@ -1116,11 +1243,29 @@ namespace simple_notepad
         const double now = ImGui::GetTime();
         std::erase_if(fades_, [&](const fade& f) { return now - f.time >= FADE_SECONDS; });
 
-        // draws [p, q) from x and returns the end x, split where recently typed characters fade and rise in
+        // draws [p, q) from x, returning the end x; split at syntax colour changes and fading new characters
         const auto draw_run = [&](int p, int q, float x, float y) {
-            while (p < q)
+            while (p < q && x <= inner.Max.x)
             {
-                int cut = q;
+                // long tokens go in pieces so drawing can stop at the right edge; whole characters only
+                int cut = std::min(q, p + 256);
+                while (cut < q && (s[cut] & 0xC0) == 0x80)
+                {
+                    ++cut;
+                }
+                ImU32 col = text_col;
+                if (const auto it = std::ranges::upper_bound(spans_, p, {}, &syntax::span::end); it != spans_.end())
+                {
+                    if (it->start <= p)
+                    {
+                        cut = std::min(cut, it->end);
+                        col = TOKEN_COLORS[static_cast<size_t>(it->kind)];
+                    }
+                    else
+                    {
+                        cut = std::min(cut, it->start);
+                    }
+                }
                 float t = 1.0f;
                 for (const fade& f : fades_)
                 {
@@ -1136,7 +1281,7 @@ namespace simple_notepad
                 }
                 const float e = motion::ease_out(t);
                 dl->AddText({x, y + text_offset + ((1.0f - e) * FADE_RISE * dpi_)},
-                            t >= 1.0f ? text_col : ImGui::GetColorU32(ImGuiCol_Text, e), s + p, s + cut);
+                            t >= 1.0f ? col : ImGui::GetColorU32(col, e), s + p, s + cut);
                 x += measure(p, cut);
                 p = cut;
             }
@@ -1183,8 +1328,22 @@ namespace simple_notepad
                 }
             }
             float x = 0.0f;
-            // raw loop: draws tab-separated runs so tab stops line up
-            for (int p = w.start; p < w.end;)
+            int p = w.start;
+            // raw loop: walks past text left of the view instead of drawing it
+            while (p < w.end)
+            {
+                unsigned int c = static_cast<unsigned char>(s[p]);
+                const int len = c < 128 ? 1 : ImTextCharFromUtf8(&c, s + p, s + w.end);
+                const float step = advance(c, x);
+                if (origin_x + x + step >= inner.Min.x)
+                {
+                    break;
+                }
+                x += step;
+                p += len;
+            }
+            // raw loop: draws tab-separated runs so tab stops line up, until past the view's right edge
+            while (p < w.end && origin_x + x <= inner.Max.x)
             {
                 const size_t tab = std::string_view(text_).substr(p, w.end - p).find('\t');
                 const int q = tab == std::string_view::npos ? w.end : p + static_cast<int>(tab);
@@ -1242,13 +1401,15 @@ namespace simple_notepad
         const float lh = line_height_;
         const float text_offset = (lh - ImGui::GetFontSize()) * 0.5f;
         const int last_row = static_cast<int>(rows_.size()) - 1;
-        const int first = std::clamp(static_cast<int>((top_ - origin_y) / lh), 0, last_row);
-        const int last = std::clamp(static_cast<int>((top_ + height_ - origin_y) / lh) + 1, 0, last_row);
+        const float view_top = unscale({0.0f, top_}).y;
+        const float view_bottom = unscale({0.0f, top_ + height_}).y;
+        const int first = std::clamp(static_cast<int>((view_top - origin_y) / lh), 0, last_row);
+        const int last = std::clamp(static_cast<int>((view_bottom - origin_y) / lh) + 1, 0, last_row);
         const int caret_line = rows_[row_of(caret_)].line;
         const ImU32 dim = ImGui::GetColorU32(ImGuiCol_TextDisabled, 0.7f);
         const ImU32 bright = ImGui::GetColorU32(ImGuiCol_Text, 0.85f);
 
-        dl->PushClipRect({x, top_}, {x + width, top_ + height_}, true);
+        dl->PushClipRect({x, view_top}, {x + width, view_bottom}, zoom_scale_ == 1.0f);
         std::array<char, 16> label{};
         for (int r = first; r <= last; ++r) // raw loop: visible rows by index
         {

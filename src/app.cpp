@@ -1,5 +1,6 @@
 #include "app.h"
 #include "ini.h"
+#include <limits>
 #include <windef.h>
 
 #define IMGUI_DEFINE_MATH_OPERATORS
@@ -36,7 +37,8 @@ namespace simple_notepad
     constexpr float MIN_WINDOW_HEIGHT = 300.0f;
     constexpr double TOAST_SECONDS = 2.2;
     constexpr double MODAL_FADE_SECONDS = 0.06;
-    constexpr std::uintmax_t MAX_FILE_BYTES = std::uintmax_t{1024} * 1024;
+    // notepad++'s limit too; the editor keeps int offsets
+    constexpr std::uintmax_t MAX_FILE_BYTES = std::numeric_limits<int>::max();
     constexpr ImVec4 CLEAR_COLOR{0.122f, 0.122f, 0.122f, 1.0f};
     constexpr COLORREF WINDOW_BRUSH = RGB(31, 31, 31);
 
@@ -456,8 +458,8 @@ namespace simple_notepad
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
 
-        // snaps: animating the size rebakes glyphs, uploads the atlas and relayouts every line each frame
-        zoom_shown_ = settings_.zoom;
+        // relayout snaps to the new size (per-frame resizing rebakes glyphs); the editor eases by scaling instead
+        zoom_shown_ = motion::approach(zoom_shown_, settings_.zoom, 20.0f, 0.001f);
         // a closed bar opens straight to its final rows; only toggling replace while it shows animates that row
         replace_anim_ = find_anim_ == 0.0f
                             ? (show_replace_ ? 1.0f : 0.0f)
@@ -683,6 +685,10 @@ namespace simple_notepad
             {
                 ImGui::MenuItem("Word Wrap", "Alt+Z", &settings_.wrap);
                 ImGui::MenuItem("Minimap", nullptr, &settings_.minimap);
+                if (ImGui::MenuItem("Syntax Highlighting", nullptr, &settings_.highlight))
+                {
+                    set_path(path_); // re-picks the language
+                }
                 ImGui::Separator();
                 if (ImGui::MenuItem("Zoom In", "Ctrl+="))
                 {
@@ -967,13 +973,26 @@ namespace simple_notepad
         // integer pixel sizes keep the dynamic font atlas from baking a new size every animation frame
         editor_.draw({
             .font = editor_font_,
-            .font_size = std::round(EDITOR_FONT_SIZE * zoom_shown_),
+            .font_size = std::round(EDITOR_FONT_SIZE * settings_.zoom),
             .wrap = settings_.wrap,
             .minimap = settings_.minimap,
             .dpi = dpi_scale_,
             .height = ImGui::GetContentRegionAvail().y - status_height,
             .show_matches = find_open_,
+            .scale = zoom_shown_ / settings_.zoom,
         });
+    }
+
+    static std::string size_label(std::uint64_t bytes)
+    {
+        if (bytes < 1024)
+        {
+            return std::format("{} bytes", bytes);
+        }
+        const auto b = static_cast<double>(bytes);
+        return b < 1024.0 * 1024          ? std::format("{:.1f} KB", b / 1024)
+               : b < 1024.0 * 1024 * 1024 ? std::format("{:.1f} MB", b / (1024.0 * 1024))
+                                          : std::format("{:.2f} GB", b / (1024.0 * 1024 * 1024));
     }
 
     void app::draw_status_bar()
@@ -1002,6 +1021,26 @@ namespace simple_notepad
 
         const std::string position = std::format("Ln {}, Col {}", editor_.line(), editor_.column());
         const std::string count = std::format("{} characters", editor_.char_count());
+        // estimated: converting the text every frame is too slow for big files, and utf-16 ignores surrogates
+        const auto chars = static_cast<std::uint64_t>(editor_.char_count());
+        const auto line_breaks = doc_.crlf ? static_cast<std::uint64_t>(editor_.line_count() - 1) : 0; // each \r
+        std::uint64_t bytes = editor_.text().size() + line_breaks;
+        switch (doc_.encoding)
+        {
+        case text_encoding::utf8_bom:
+            bytes += 3;
+            break;
+        case text_encoding::utf16_le:
+        case text_encoding::utf16_be:
+            bytes = 2 + ((chars + line_breaks) * 2);
+            break;
+        case text_encoding::ansi:
+            bytes = chars + line_breaks;
+            break;
+        case text_encoding::utf8:
+            break;
+        }
+        const std::string size = size_label(bytes);
         const char* encoding = text_file::encoding_name(doc_.encoding);
         const char* eol = doc_.crlf ? "Windows (CRLF)" : "Unix (LF)";
         const std::string zoom = std::format("{}%", static_cast<int>(std::round(settings_.zoom * 100)));
@@ -1009,13 +1048,15 @@ namespace simple_notepad
         const float pad = style.FramePadding.x * 2;
         const float gap = style.ItemSpacing.x * 2;
         const float width = ImGui::CalcTextSize(position.c_str()).x + ImGui::CalcTextSize(count.c_str()).x +
-                            ImGui::CalcTextSize(encoding).x + ImGui::CalcTextSize(eol).x +
-                            ImGui::CalcTextSize(zoom.c_str()).x + (pad * 3) + (gap * 4);
+                            ImGui::CalcTextSize(size.c_str()).x + ImGui::CalcTextSize(encoding).x +
+                            ImGui::CalcTextSize(eol).x + ImGui::CalcTextSize(zoom.c_str()).x + (pad * 3) + (gap * 5);
         ImGui::SameLine(std::max(ImGui::GetContentRegionMax().x - width, 0.0f));
         ImGui::AlignTextToFramePadding();
         ImGui::TextDisabled("%s", position.c_str());
         ImGui::SameLine(0, gap);
         ImGui::TextDisabled("%s", count.c_str());
+        ImGui::SameLine(0, gap);
+        ImGui::TextDisabled("%s", size.c_str());
         ImGui::SameLine(0, gap);
         ImGui::PushStyleColor(ImGuiCol_Text, style.Colors[ImGuiCol_TextDisabled]);
         if (ImGui::Button(encoding))
@@ -1129,7 +1170,7 @@ namespace simple_notepad
         {
         case action::new_file:
             doc_ = {};
-            path_.clear();
+            set_path({});
             editor_.set_text({});
             saved_state_ = editor_.state();
             format_changed_ = false;
@@ -1158,14 +1199,18 @@ namespace simple_notepad
         {
             // like notepad: a missing path starts an empty document that saving will create
             perform(action::new_file);
-            path_ = path;
+            set_path(path);
             return;
         }
         if (const auto size = std::filesystem::file_size(path, ec); !ec && size > MAX_FILE_BYTES)
         {
+            const auto wide_size = [](std::uintmax_t bytes) {
+                const std::string label = size_label(bytes); // ascii, so widening byte by byte is exact
+                return std::wstring(label.begin(), label.end());
+            };
             const std::wstring message =
-                std::format(L"\"{}\" is too large ({:.1f} MB).\nThe limit is 1 MB.", path.filename().wstring(),
-                            static_cast<double>(size) / (1024.0 * 1024.0));
+                std::format(L"\"{}\" is too large ({}).\nThe limit is {}.", path.filename().wstring(), wide_size(size),
+                            wide_size(MAX_FILE_BYTES));
             MessageBoxW(hwnd_, message.c_str(), L"Simple Notepad", MB_ICONWARNING);
             return;
         }
@@ -1175,7 +1220,7 @@ namespace simple_notepad
             editor_.set_text(std::move(loaded.text));
             doc_ = std::move(loaded);
             doc_.text.clear(); // the editor owns the text
-            path_ = path;
+            set_path(path);
             saved_state_ = editor_.state();
             format_changed_ = false;
         }
@@ -1194,7 +1239,7 @@ namespace simple_notepad
             {
                 return false;
             }
-            path_ = *chosen;
+            set_path(*chosen);
         }
         try
         {
@@ -1313,6 +1358,12 @@ namespace simple_notepad
         toast_time_ = ImGui::GetTime();
     }
 
+    void app::set_path(std::filesystem::path path)
+    {
+        path_ = std::move(path);
+        editor_.set_language(settings_.highlight ? syntax::find(path_) : nullptr);
+    }
+
     void app::update_title()
     {
         const std::wstring name = path_.empty() ? L"Untitled" : path_.filename().wstring();
@@ -1339,6 +1390,7 @@ namespace simple_notepad
         const ini file = ini::load(settings_path());
         file.get("view", "wrap", settings_.wrap);
         file.get("view", "minimap", settings_.minimap);
+        file.get("view", "highlight", settings_.highlight);
     }
 
     void app::save_settings() const
@@ -1346,6 +1398,7 @@ namespace simple_notepad
         ini file;
         file.set("view", "wrap", settings_.wrap);
         file.set("view", "minimap", settings_.minimap);
+        file.set("view", "highlight", settings_.highlight);
         file.save(settings_path());
     }
 

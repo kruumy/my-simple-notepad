@@ -1,5 +1,6 @@
 #pragma once
 
+#include "syntax.h"
 #include <array>
 #include <cstdint>
 #include <deque>
@@ -11,6 +12,7 @@
 
 struct ImFont;
 struct ImFontBaked;
+struct ImVec2;
 
 namespace simple_notepad
 {
@@ -27,6 +29,7 @@ namespace simple_notepad
             float dpi = 1.0f;
             float height = 0.0f;
             bool show_matches = false; // highlights in the text and marks in the minimap
+            float scale = 1.0f;        // an eased zoom draws the text at this size relative to font_size
         };
 
         static constexpr int MAX_MATCHES = 20000; // bounds time and memory for a short needle in a huge file
@@ -38,6 +41,7 @@ namespace simple_notepad
         void insert(std::string_view text);
         void select(int start, int end); // leaves focus where it is
         void focus();
+        void set_language(const syntax::language* lang); // nullptr for plain text
         void set_search(std::string_view needle, bool match_case);
         [[nodiscard]] std::optional<size_t> search(size_t from, bool backward) const; // wraps around
         // index of the selected match (-1 when the selection is not one) and the match count
@@ -59,6 +63,10 @@ namespace simple_notepad
         [[nodiscard]] int char_count() const
         {
             return char_count_;
+        }
+        [[nodiscard]] int line_count() const
+        {
+            return line_count_;
         }
         // differs after every edit and returns to earlier values on undo, so it can track the saved point
         [[nodiscard]] std::uint64_t state() const;
@@ -120,6 +128,11 @@ namespace simple_notepad
         bool show_matches_ = false;
         bool matches_capped_ = false;
         std::vector<std::pair<int, int>> matches_; // sorted, non-overlapping byte ranges of needle_
+        const syntax::language* language_ = nullptr;
+        std::vector<syntax::span> spans_;
+        bool spans_dirty_ = false;                                     // needs a full scan
+        syntax::edit edited_{.start = -1, .old_end = 0, .new_end = 0}; // range changed since the last scan
+        int scanned_size_ = 0;
         std::vector<row> rows_{{.start = 0, .end = 0, .line = 0, .first = true, .width = 0.0f}};
         int line_count_ = 1;
         int char_count_ = 0;
@@ -163,6 +176,9 @@ namespace simple_notepad
         float view_left_ = 0.0f; // screen x of the text view
         float view_width_ = 0.0f;
         float view_height_ = 0.0f;
+        float zoom_scale_ = 1.0f;
+        float zoom_x_ = 0.0f; // screen point an eased zoom scales about: the mouse, or else the caret
+        float zoom_y_ = 0.0f;
         float caret_x_ = 0.0f; // animated, content space
         float caret_y_ = 0.0f;
         bool caret_settled_ = true;
@@ -178,6 +194,7 @@ namespace simple_notepad
         [[nodiscard]] bool same_char(char a, char b) const; // honours needle_case_
         [[nodiscard]] int row_of(int pos) const;
         [[nodiscard]] float x_of(int pos) const;
+        [[nodiscard]] ImVec2 unscale(ImVec2 p) const;
         [[nodiscard]] int pos_at(int row_index, float x) const;
 
         [[nodiscard]] int next_char(int pos) const;

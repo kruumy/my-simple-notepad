@@ -35,6 +35,7 @@ namespace simple_notepad
         {
             bool wrap = true;
             bool minimap = true;
+            bool highlight = true;
             float zoom = 1.0f;
         };
 
@@ -121,6 +122,7 @@ namespace simple_notepad
         void set_zoom(float zoom);
         void show_toast(std::string text);
         void update_title();
+        void set_path(std::filesystem::path path); // also picks the highlighting language
 
         static std::filesystem::path settings_path();
         void load_settings();

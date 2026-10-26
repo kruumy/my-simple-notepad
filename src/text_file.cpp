@@ -4,7 +4,6 @@
 #include <cstring>
 #include <format>
 #include <fstream>
-#include <iterator>
 #include <stdexcept>
 
 namespace simple_notepad
@@ -16,6 +15,10 @@ namespace simple_notepad
             return {};
         }
         const int len = MultiByteToWideChar(code_page, 0, bytes.data(), static_cast<int>(bytes.size()), nullptr, 0);
+        if (len == 0)
+        {
+            throw std::runtime_error("The text is too large to convert"); // an empty result would lose it
+        }
         std::wstring out(static_cast<size_t>(len), L'\0');
         MultiByteToWideChar(code_page, 0, bytes.data(), static_cast<int>(bytes.size()), out.data(), len);
         return out;
@@ -29,6 +32,10 @@ namespace simple_notepad
         }
         const int len =
             WideCharToMultiByte(code_page, 0, wide.data(), static_cast<int>(wide.size()), nullptr, 0, nullptr, nullptr);
+        if (len == 0)
+        {
+            throw std::runtime_error("The text is too large to convert"); // an empty result would lose it
+        }
         std::string out(static_cast<size_t>(len), '\0');
         WideCharToMultiByte(code_page, 0, wide.data(), static_cast<int>(wide.size()), out.data(), len, nullptr,
                             nullptr);
@@ -56,14 +63,17 @@ namespace simple_notepad
         {
             throw std::runtime_error(std::format("Cannot open \"{}\"", from_wide(path.filename().wstring(), CP_UTF8)));
         }
-        const std::string bytes{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+        std::string bytes(static_cast<size_t>(std::filesystem::file_size(path)), '\0');
+        in.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        bytes.resize(static_cast<size_t>(in.gcount())); // the file may have shrunk since its size was read
 
         text_file file;
         const std::string_view view = bytes;
         if (view.starts_with("\xEF\xBB\xBF"))
         {
             file.encoding = text_encoding::utf8_bom;
-            file.text = view.substr(3);
+            file.text = std::move(bytes); // moved, not copied: big files would briefly need twice the memory
+            file.text.erase(0, 3);
         }
         else if (view.starts_with("\xFF\xFE") || view.starts_with("\xFE\xFF"))
         {
@@ -83,7 +93,7 @@ namespace simple_notepad
         }
         else if (is_valid_utf8(view))
         {
-            file.text = bytes;
+            file.text = std::move(bytes);
         }
         else
         {

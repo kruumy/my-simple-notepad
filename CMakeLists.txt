@@ -12,6 +12,7 @@ add_executable(${PROJECT_NAME} WIN32
     "src/app.cpp"
     "src/editor.cpp"
     "src/ini.cpp"
+    "src/syntax.cpp"
     "src/text_file.cpp"
     "res/app.rc"
 )
