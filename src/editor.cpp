@@ -75,13 +75,18 @@ namespace simple_notepad
 
     // ---------------------------------------------------------------- public
 
-    void editor::set_text(std::string text)
+    void editor::set_text(std::string text, const syntax::language* lang, std::vector<syntax::span> spans)
     {
         text_ = gap_buffer<std::string>(std::move(text));
+        language_ = lang;
+        spans_ = syntax::span_buffer(std::move(spans));
+        spans_dirty_ = false;
+        edited_ = {.start = -1, .old_end = 0, .new_end = 0};
+        scanned_size_ = static_cast<int>(text_.size());
+        ++revision_;
         column_pos_ = -1;
         fades_.clear();
         matches_dirty_ = true;
-        spans_dirty_ = true;
         undo_.clear();
         redo_.clear();
         caret_ = anchor_ = 0;
@@ -89,6 +94,12 @@ namespace simple_notepad
         layout_dirty_ = true;
         snap_caret_ = true;
         focus_request_ = true;
+    }
+
+    std::vector<syntax::span> editor::scan(const syntax::language* lang, std::string_view text)
+    {
+        return lang != nullptr && std::cmp_less_equal(text.size(), MAX_HIGHLIGHT_BYTES) ? syntax::scan(*lang, text)
+                                                                                        : std::vector<syntax::span>{};
     }
 
     void editor::replace_all(std::string text)
@@ -249,8 +260,15 @@ namespace simple_notepad
 
     float editor::measure(int start, int end) const
     {
-        float x = 0.0f;
         const char* s = text_.contiguous(start, end);
+        // monospace printable ascii, most big data files, is a count; summing advances one by one is a serial chain
+        // counted rather than all_of: no early exit lets the compiler check many bytes per instruction
+        const auto unprintable = [](char c) { return static_cast<unsigned char>(c - ' ') > '~' - ' '; };
+        if (mono_advance_ > 0.0f && std::count_if(s + start, s + end, unprintable) == 0)
+        {
+            return mono_advance_ * static_cast<float>(end - start);
+        }
+        float x = 0.0f;
         // raw loop: utf-8 decoding steps a variable number of bytes
         for (int p = start; p < end;)
         {
@@ -737,6 +755,10 @@ namespace simple_notepad
 
     void editor::apply(int pos, int remove, std::string insert, merge kind)
     {
+        if (read_only_)
+        {
+            return;
+        }
         if (text_.size() - remove + insert.size() > static_cast<size_t>(std::numeric_limits<int>::max()))
         {
             return; // offsets are int: refusing the edit beats corrupting the text
@@ -790,7 +812,7 @@ namespace simple_notepad
 
     void editor::undo()
     {
-        if (undo_.empty())
+        if (read_only_ || undo_.empty())
         {
             return;
         }
@@ -804,7 +826,7 @@ namespace simple_notepad
 
     void editor::redo()
     {
-        if (redo_.empty())
+        if (read_only_ || redo_.empty())
         {
             return;
         }
@@ -1308,8 +1330,7 @@ namespace simple_notepad
         if (spans_dirty_)
         {
             ++revision_;
-            spans_ = syntax::span_buffer(highlight ? syntax::scan(*language_, text_.view(0, text_.size()))
-                                                   : std::vector<syntax::span>{});
+            spans_ = syntax::span_buffer(scan(language_, text_.view(0, text_.size())));
         }
         else if (highlight && edited_.start >= 0)
         {

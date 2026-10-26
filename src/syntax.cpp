@@ -89,7 +89,9 @@ namespace simple_notepad
     bool syntax::is_word(char c)
     {
         const auto u = static_cast<unsigned char>(c);
-        return std::isalnum(u) != 0 || c == '_' || u >= 0x80; // utf-8 bytes, so a word never splits a character
+        // ascii by hand: std::isalnum looks up the locale on every call, the bulk of a scan
+        return (u >= 'a' && u <= 'z') || (u >= 'A' && u <= 'Z') || (u >= '0' && u <= '9') || c == '_' ||
+               u >= 0x80; // utf-8 bytes, so a word never splits a character
     }
 
     // end of the string at i, or npos if unclosed on its line; never looking past it keeps edits local
@@ -263,6 +265,26 @@ namespace simple_notepad
             j.out.push_back({.start = static_cast<int>(a), .end = static_cast<int>(b), .kind = kind});
             span_end = b;
         };
+        // bytes that can begin a token; any other byte is skipped without trying each opener
+        std::array<bool, 256> opens{};
+        for (int b = 0; b < 256; ++b) // raw loop: fills a lookup table by index
+        {
+            opens[b] = is_word(static_cast<char>(b));
+        }
+        for (const char b : {'"', '`', '\''})
+        {
+            opens[static_cast<unsigned char>(b)] = true;
+        }
+        opens['['] = lang.sections;
+        for (const std::string_view s :
+             {lang.blocks[0].open, lang.blocks[1].open, lang.line_comments[0], lang.line_comments[1]})
+        {
+            if (!s.empty())
+            {
+                opens[static_cast<unsigned char>(s[0])] = true;
+            }
+        }
+
         size_t cap = j.cap; // where the current line stops being highlighted
         size_t i = j.from;
         while (i < text.size()) // raw loop: each token decides how far to advance
@@ -284,6 +306,11 @@ namespace simple_notepad
                 }
                 const size_t newline = text.find('\n', i); // nothing more is highlighted on this line
                 i = newline == std::string_view::npos ? text.size() : newline + 1;
+                continue;
+            }
+            if (!opens[static_cast<unsigned char>(text[i])])
+            {
+                ++i;
                 continue;
             }
             // single-line tokens end at the cap

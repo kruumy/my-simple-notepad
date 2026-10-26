@@ -6,6 +6,7 @@
 #include <d3d11.h>
 #include <dxgi1_3.h>
 #include <filesystem>
+#include <future>
 #include <optional>
 #include <string>
 #include <vector>
@@ -27,7 +28,28 @@ namespace simple_notepad
             new_file,
             open_file,
             open_dropped,
+            reload,
             exit,
+        };
+
+        // a file read and highlighted on a worker thread
+        struct opened
+        {
+            std::filesystem::path path;
+            text_file file;
+            const syntax::language* language;
+            std::vector<syntax::span> spans;
+        };
+
+        // a save in flight and the document state it writes
+        struct save_job
+        {
+            std::future<std::optional<file_stamp>> result;
+            std::uint64_t state;
+            text_encoding encoding;
+            bool crlf;
+            action then;           // performed once the save succeeds
+            bool repeated = false; // a big file saved again soon after the last save
         };
 
         struct settings
@@ -59,6 +81,12 @@ namespace simple_notepad
         editor editor_;
         std::uint64_t saved_state_ = 0;
         bool format_changed_ = false; // encoding or line endings edited
+        std::future<opened> opening_;
+        std::optional<save_job> saving_;
+        double big_save_time_ = -100.0; // when the last save of a big file started
+        bool save_warning_ = false;     // shows the repeated big save popup
+        bool save_warned_ = false;
+        bool reload_prompt_ = false; // another program changed the file
         std::wstring shown_title_;
         std::string title_utf8_;
         RECT caption_{}; // client-space strip of the menu bar that drags the window
@@ -109,13 +137,23 @@ namespace simple_notepad
         void draw_find_bar();
         void draw_editor();
         void draw_status_bar();
+        bool begin_modal(const char* id); // fades the modal in; always pair with end_modal
+        void end_modal(bool shown);
         void draw_unsaved_modal();
+        void draw_reload_modal();
+        void draw_save_warning();
         void handle_shortcuts();
 
         void request(action next);
         void perform(action next);
         void open(const std::filesystem::path& path);
-        bool save(bool save_as);
+        void save(bool save_as, action then = action::none);
+        template <typename write_type> void end_save(const save_job& job, write_type write);
+        [[nodiscard]] bool still_opening(); // and says so: edits and saves wait for a loading file
+        void poll_io();                     // collects finished loads and saves
+        void finish_open();
+        void finish_save(); // waits if the save is still running
+        void check_disk();
         bool select_match(size_t from, bool backward);
         void find_next(bool backward);
         void replace_next();

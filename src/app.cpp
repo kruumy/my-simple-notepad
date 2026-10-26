@@ -18,8 +18,13 @@
 #include <cstring>
 #include <dwmapi.h>
 #include <format>
+#include <future>
 #include <limits>
+#include <memory>
 #include <shellapi.h>
+#include <system_error>
+#include <thread>
+#include <type_traits>
 #include <windef.h>
 #include <windowsx.h>
 
@@ -41,8 +46,35 @@ namespace simple_notepad
     constexpr std::uintmax_t MAX_FILE_BYTES = std::numeric_limits<int>::max();
     // rewrapping costs about 1 ms per MB on every zoom or resize step, so bigger files stay unwrapped
     constexpr size_t MAX_WRAP_BYTES = static_cast<const size_t>(16 * 1024 * 1024);
+    // smaller files save on the ui thread: the write is quicker than copying the text for a worker
+    constexpr size_t ASYNC_SAVE_BYTES = static_cast<const size_t>(4 * 1024 * 1024);
+    // saves of files this big closer together than REPEAT_SAVE_SECONDS get a warning
+    constexpr size_t WARN_SAVE_BYTES = static_cast<const size_t>(16 * 1024 * 1024);
+    constexpr double REPEAT_SAVE_SECONDS = 10.0;
     constexpr ImVec4 CLEAR_COLOR{0.122f, 0.122f, 0.122f, 1.0f};
     constexpr COLORREF WINDOW_BRUSH = RGB(31, 31, 31);
+
+    // runs work on its own thread, then posts a message so the sleeping event loop wakes to collect the result.
+    // detached: dropping the future of a superseded load must not wait for it
+    template <typename work_type>
+    static std::future<std::invoke_result_t<work_type&>> run_detached(HWND hwnd, work_type work)
+    {
+        // shared, so the work outlives a thread that never started; the task stores any exception in the future
+        auto task = std::make_shared<std::packaged_task<std::invoke_result_t<work_type&>()>>(std::move(work));
+        std::future<std::invoke_result_t<work_type&>> result = task->get_future();
+        try
+        {
+            std::thread([hwnd, task] {
+                (*task)();
+                PostMessageW(hwnd, WM_APP, 0, 0); // after the result is set, so the woken loop finds it ready
+            }).detach();
+        }
+        catch (const std::system_error&)
+        {
+            (*task)(); // no thread to be had: do the work here, slower but never lost
+        }
+        return result;
+    }
 
     static void apply_theme(ImGuiStyle& style)
     {
@@ -132,6 +164,14 @@ namespace simple_notepad
         // the gpu driver takes ~200 ms to create a device, so show the empty window first; frames wait for ready_
         ShowWindow(hwnd_, SW_SHOWNORMAL);
         UpdateWindow(hwnd_); // paints the background brush now, as the loop is not pumping yet
+        if (!open_path.empty())
+        {
+            // started first, so the file loads while the device is created
+            // a relative argument would otherwise follow the working directory, which the file dialogs change
+            std::error_code ec;
+            const std::filesystem::path full = std::filesystem::absolute(open_path, ec);
+            open(ec ? std::filesystem::path(open_path) : full);
+        }
         if (!create_device())
         {
             MessageBoxW(nullptr, L"Could not create a Direct3D 11 device.", L"Simple Notepad", MB_ICONERROR);
@@ -166,14 +206,6 @@ namespace simple_notepad
 
         set_dpi(ImGui_ImplWin32_GetDpiScaleForHwnd(hwnd_));
         zoom_shown_ = settings_.zoom;
-
-        if (!open_path.empty())
-        {
-            // a relative argument would otherwise follow the working directory, which the file dialogs change
-            std::error_code ec;
-            const std::filesystem::path full = std::filesystem::absolute(open_path, ec);
-            open(ec ? std::filesystem::path(open_path) : full);
-        }
         update_title();
         ready_ = true;
 
@@ -190,6 +222,7 @@ namespace simple_notepad
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
+            poll_io();
             if (!running_)
             {
                 break;
@@ -211,6 +244,11 @@ namespace simple_notepad
             --frames_;
         }
 
+        if (saving_)
+        {
+            saving_->then = action::none; // the app is closing; only the write itself must finish
+            finish_save();
+        }
         save_settings();
         ImGui_ImplDX11_Shutdown();
         ImGui_ImplWin32_Shutdown();
@@ -407,6 +445,10 @@ namespace simple_notepad
         }
         case WM_ACTIVATE:
             focused_ = LOWORD(wparam) != WA_INACTIVE;
+            if (focused_)
+            {
+                check_disk();
+            }
             break;
         case WM_DPICHANGED: {
             set_dpi(static_cast<float>(HIWORD(wparam)) / USER_DEFAULT_SCREEN_DPI);
@@ -449,7 +491,8 @@ namespace simple_notepad
         return zoom_shown_ != settings_.zoom || find_anim_ != (find_open_ ? 1.0f : 0.0f) ||
                replace_anim_ != (show_replace_ ? 1.0f : 0.0f) || editor_.animating() ||
                now - toast_time_ < TOAST_SECONDS ||
-               (pending_ != action::none && now - modal_time_ < MODAL_FADE_SECONDS);
+               ((pending_ != action::none || reload_prompt_ || save_warning_) &&
+                now - modal_time_ < MODAL_FADE_SECONDS);
     }
 
     bool app::dirty() const
@@ -499,6 +542,8 @@ namespace simple_notepad
         draw_editor();
         draw_status_bar();
         draw_unsaved_modal();
+        draw_reload_modal();
+        draw_save_warning();
 
         ImGui::End();
         ImGui::Render();
@@ -609,7 +654,7 @@ namespace simple_notepad
         {
             find_next(true);
         }
-        if (ImGui::Shortcut(ImGuiKey_F5, global) && editor_.focused())
+        if (ImGui::Shortcut(ImGuiKey_F5, global) && editor_.focused() && !still_opening())
         {
             const auto now = std::chrono::current_zone()->to_local(std::chrono::system_clock::now());
             editor_.insert(std::format("{:%H:%M %d/%m/%Y}", std::chrono::floor<std::chrono::seconds>(now)));
@@ -1043,7 +1088,12 @@ namespace simple_notepad
         ImGui::SetCursorPosY((ImGui::GetWindowHeight() - ImGui::GetFrameHeight()) * 0.5f);
 
         const double since = ImGui::GetTime() - toast_time_;
-        if (since < TOAST_SECONDS)
+        if (opening_.valid() || saving_)
+        {
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextDisabled(opening_.valid() ? "Opening..." : "Saving...");
+        }
+        else if (since < TOAST_SECONDS)
         {
             // quick fade in, hold, then a slow fade out
             const float alpha = std::min(motion::ease_out(static_cast<float>(since) / 0.15f),
@@ -1131,13 +1181,8 @@ namespace simple_notepad
         ImGui::PopStyleVar(2);
     }
 
-    void app::draw_unsaved_modal()
+    bool app::begin_modal(const char* id)
     {
-        constexpr const char* id = "Unsaved changes";
-        if (pending_ == action::none)
-        {
-            return;
-        }
         if (!ImGui::IsPopupOpen(id))
         {
             ImGui::OpenPopup(id);
@@ -1153,9 +1198,28 @@ namespace simple_notepad
         // drift up a few pixels while fading in
         ImGui::SetNextWindowPos(viewport->GetCenter() + ImVec2(0, (1.0f - t) * 12.0f * dpi_scale_), ImGuiCond_Always,
                                 {0.5f, 0.5f});
+        return ImGui::BeginPopupModal(
+            id, nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove);
+    }
 
-        if (ImGui::BeginPopupModal(
-                id, nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove))
+    void app::end_modal(bool shown)
+    {
+        if (shown)
+        {
+            ImGui::EndPopup();
+        }
+        ImGui::PopStyleVar(2);
+        ImGui::PopStyleColor();
+    }
+
+    void app::draw_unsaved_modal()
+    {
+        if (pending_ == action::none)
+        {
+            return;
+        }
+        const bool shown = begin_modal("Unsaved changes");
+        if (shown)
         {
             const std::string name = path_.empty() ? "Untitled" : text_file::to_utf8(path_.filename().wstring());
             ImGui::Text("Save changes to %s?", name.c_str());
@@ -1176,21 +1240,85 @@ namespace simple_notepad
             {
                 pending_ = action::none;
                 ImGui::CloseCurrentPopup();
-                if ((save_clicked && save(false)) || discard)
+                if (save_clicked)
+                {
+                    save(false, next);
+                }
+                else if (discard)
                 {
                     perform(next);
                 }
             }
-            ImGui::EndPopup();
         }
-        ImGui::PopStyleVar(2);
-        ImGui::PopStyleColor();
+        end_modal(shown);
+    }
+
+    void app::draw_reload_modal()
+    {
+        if (!reload_prompt_ || pending_ != action::none)
+        {
+            return;
+        }
+        const bool shown = begin_modal("Changed on disk");
+        if (shown)
+        {
+            const std::string name = text_file::to_utf8(path_.filename().wstring());
+            ImGui::Text("%s was changed by another program.", name.c_str());
+            ImGui::TextDisabled(dirty() ? "Reloading it discards your unsaved changes."
+                                        : "Reload it to see the changes.");
+            ImGui::Dummy(ImVec2(0, 6) * dpi_scale_);
+
+            const ImVec2 button(110 * dpi_scale_, 0);
+            ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyle().Colors[ImGuiCol_HeaderActive]);
+            const bool reload = ImGui::Button("Reload", button) || ImGui::IsKeyPressed(ImGuiKey_Enter);
+            ImGui::PopStyleColor();
+            ImGui::SameLine();
+            const bool keep = ImGui::Button("Keep current", button) || ImGui::IsKeyPressed(ImGuiKey_Escape);
+            if (reload || keep)
+            {
+                reload_prompt_ = false;
+                ImGui::CloseCurrentPopup();
+                if (reload)
+                {
+                    perform(action::reload);
+                }
+            }
+        }
+        end_modal(shown);
+    }
+
+    void app::draw_save_warning()
+    {
+        if (!save_warning_ || pending_ != action::none || reload_prompt_)
+        {
+            return;
+        }
+        const bool shown = begin_modal("Big file saves");
+        if (shown)
+        {
+            ImGui::Text("Each save rewrites all %s of this file.", size_label(editor_.byte_count()).c_str());
+            ImGui::TextDisabled("Big writes are slow and wear the disk, so try to save only when needed.");
+            ImGui::Dummy(ImVec2(0, 6) * dpi_scale_);
+            ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyle().Colors[ImGuiCol_HeaderActive]);
+            if (ImGui::Button("OK", ImVec2(110 * dpi_scale_, 0)) || ImGui::IsKeyPressed(ImGuiKey_Enter) ||
+                ImGui::IsKeyPressed(ImGuiKey_Escape))
+            {
+                save_warning_ = false;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::PopStyleColor();
+        }
+        end_modal(shown);
     }
 
     // ---------------------------------------------------------------- actions
 
     void app::request(action next)
     {
+        if (saving_)
+        {
+            finish_save(); // what it saves decides whether there is anything unsaved
+        }
         if (dirty())
         {
             pending_ = next;
@@ -1203,12 +1331,18 @@ namespace simple_notepad
 
     void app::perform(action next)
     {
+        if (saving_)
+        {
+            finish_save(); // its result belongs to the document about to be replaced
+        }
         switch (next)
         {
         case action::new_file:
+            opening_ = {}; // a load still running would replace the new document
+            editor_.set_read_only(false);
             doc_ = {};
             set_path({});
-            editor_.set_text({});
+            editor_.set_text({}, nullptr, {});
             saved_state_ = editor_.state();
             format_changed_ = false;
             break;
@@ -1220,6 +1354,9 @@ namespace simple_notepad
             break;
         case action::open_dropped:
             open(dropped_path_);
+            break;
+        case action::reload:
+            open(path_);
             break;
         case action::exit:
             running_ = false;
@@ -1251,15 +1388,117 @@ namespace simple_notepad
             MessageBoxW(hwnd_, message.c_str(), L"Simple Notepad", MB_ICONWARNING);
             return;
         }
+        // read and highlighted on a worker so the window stays live; the shown text can't change until it lands
+        const syntax::language* language = settings_.highlight ? syntax::find(path) : nullptr;
+        opening_ = run_detached(hwnd_, [path, language] {
+            text_file file = text_file::load(path);
+            std::vector<syntax::span> spans = editor::scan(language, file.text);
+            return opened{.path = path, .file = std::move(file), .language = language, .spans = std::move(spans)};
+        });
+        editor_.set_read_only(true);
+    }
+
+    // write returns the saved file's stamp or throws; the document counts as saved as it was when the save began
+    template <typename write_type> void app::end_save(const save_job& job, write_type write)
+    {
         try
         {
-            text_file loaded = text_file::load(path);
-            editor_.set_text(std::move(loaded.text));
-            doc_ = std::move(loaded);
-            doc_.text.clear(); // the editor owns the text
-            set_path(path);
+            doc_.stamp = write();
+        }
+        catch (const std::exception& e)
+        {
+            const std::wstring message(e.what(), e.what() + std::strlen(e.what()));
+            MessageBoxW(hwnd_, message.c_str(), L"Save failed", MB_ICONERROR);
+            return;
+        }
+        saved_state_ = job.state;
+        format_changed_ = doc_.encoding != job.encoding || doc_.crlf != job.crlf; // one picked during the save
+        show_toast("Saved");
+        if (job.repeated && !save_warned_)
+        {
+            save_warning_ = save_warned_ = true; // once per session, so it informs without nagging
+        }
+        perform(job.then);
+    }
+
+    bool app::still_opening()
+    {
+        if (opening_.valid())
+        {
+            show_toast("Wait for the file to finish opening");
+        }
+        return opening_.valid();
+    }
+
+    void app::save(bool save_as, action then)
+    {
+        if (saving_)
+        {
+            finish_save(); // one at a time, so saves land in order
+        }
+        if (still_opening())
+        {
+            return; // the result would land on the document replacing this one
+        }
+        if (save_as || path_.empty())
+        {
+            const auto chosen = file_dialog(hwnd_, true, path_.empty() ? L"Untitled.txt" : path_.wstring());
+            if (!chosen)
+            {
+                return;
+            }
+            set_path(*chosen);
+        }
+        save_job job{.state = editor_.state(), .encoding = doc_.encoding, .crlf = doc_.crlf, .then = then};
+        if (editor_.byte_count() < ASYNC_SAVE_BYTES)
+        {
+            end_save(job, [this] { return text_file::save(path_, editor_.text_runs(), doc_.encoding, doc_.crlf); });
+            return;
+        }
+        // each save rewrites the whole file, so frequent saving of a big one wears on the disk
+        const double now = ImGui::GetTime();
+        job.repeated = editor_.byte_count() >= WARN_SAVE_BYTES && now - big_save_time_ < REPEAT_SAVE_SECONDS;
+        big_save_time_ = now;
+        // the worker writes its own copy, so editing can go on meanwhile
+        const auto [head, tail] = editor_.text_runs();
+        std::string copy;
+        copy.reserve(head.size() + tail.size());
+        copy.append(head).append(tail);
+        job.result =
+            run_detached(hwnd_, [path = path_, copy = std::move(copy), encoding = doc_.encoding, crlf = doc_.crlf] {
+                return text_file::save(path, {copy, {}}, encoding, crlf);
+            });
+        saving_ = std::move(job);
+    }
+
+    void app::poll_io()
+    {
+        const auto ready = [](const auto& result) {
+            return result.valid() && result.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+        };
+        if (ready(opening_))
+        {
+            finish_open();
+        }
+        if (saving_ && ready(saving_->result))
+        {
+            finish_save();
+        }
+    }
+
+    void app::finish_open()
+    {
+        editor_.set_read_only(false);
+        try
+        {
+            opened loaded = opening_.get();
+            editor_.set_text(std::move(loaded.file.text), loaded.language, std::move(loaded.spans));
+            doc_ = std::move(loaded.file);
+            doc_.text.clear();                // the editor owns the text
+            set_path(std::move(loaded.path)); // rescans only if highlighting was toggled during the load
             saved_state_ = editor_.state();
             format_changed_ = false;
+            reload_prompt_ = false;
         }
         catch (const std::exception& e)
         {
@@ -1267,30 +1506,30 @@ namespace simple_notepad
         }
     }
 
-    bool app::save(bool save_as)
+    void app::finish_save()
     {
-        if (save_as || path_.empty())
+        save_job job = std::move(*saving_);
+        saving_.reset();
+        end_save(job, [&job] { return job.result.get(); });
+    }
+
+    // asked when the window gains focus, as most editors do, rather than watching the folder
+    void app::check_disk()
+    {
+        if (path_.empty() || opening_.valid() || saving_)
         {
-            const auto chosen = file_dialog(hwnd_, true, path_.empty() ? L"Untitled.txt" : path_.wstring());
-            if (!chosen)
-            {
-                return false;
-            }
-            set_path(*chosen);
+            return;
         }
-        try
+        // a missing file is left alone: it may be one saving will create
+        const auto now = text_file::stamp_of(path_);
+        if (now && !doc_.stamp)
         {
-            text_file::save(path_, editor_.text_runs(), doc_.encoding, doc_.crlf);
-            saved_state_ = editor_.state();
-            format_changed_ = false;
-            show_toast("Saved");
-            return true;
+            doc_.stamp = now; // unknown since a save could not read it back, so adopt it rather than claim a change
         }
-        catch (const std::exception& e)
+        else if (now && *now != *doc_.stamp)
         {
-            const std::wstring message(e.what(), e.what() + std::strlen(e.what()));
-            MessageBoxW(hwnd_, message.c_str(), L"Save failed", MB_ICONERROR);
-            return false;
+            doc_.stamp = *now; // asks once per change
+            reload_prompt_ = true;
         }
     }
 
@@ -1325,7 +1564,7 @@ namespace simple_notepad
 
     void app::replace_next()
     {
-        if (find_text_.empty())
+        if (find_text_.empty() || still_opening())
         {
             return;
         }
@@ -1351,7 +1590,7 @@ namespace simple_notepad
 
     void app::replace_all()
     {
-        if (find_text_.empty())
+        if (find_text_.empty() || still_opening())
         {
             return;
         }
@@ -1385,6 +1624,10 @@ namespace simple_notepad
 
     void app::format_json()
     {
+        if (still_opening())
+        {
+            return;
+        }
         const std::string_view text = editor_.text();
         const size_t first = text.find_first_not_of(" \t\r\n");
         if (first == std::string_view::npos || (text[first] != '{' && text[first] != '['))

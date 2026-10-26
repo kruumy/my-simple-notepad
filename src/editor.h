@@ -38,7 +38,13 @@ namespace simple_notepad
 
         void draw(const view& v);
 
-        void set_text(std::string text);    // clears undo history
+        // clears undo history; spans must be scan(lang, text), which a loading thread can run ahead
+        void set_text(std::string text, const syntax::language* lang, std::vector<syntax::span> spans);
+        [[nodiscard]] static std::vector<syntax::span> scan(const syntax::language* lang, std::string_view text);
+        void set_read_only(bool read_only) // e.g. while a file loads to replace the text
+        {
+            read_only_ = read_only;
+        }
         void replace_all(std::string text); // one undoable step
         void insert(std::string_view text);
         void select(int start, int end); // leaves focus where it is
@@ -160,7 +166,8 @@ namespace simple_notepad
         };
 
         mutable gap_buffer<std::string> text_; // mutable: making a range one run moves the gap, not the text
-        std::vector<fade> fades_;              // recently inserted byte ranges that are still fading in
+        bool read_only_ = false;
+        std::vector<fade> fades_; // recently inserted byte ranges that are still fading in
         std::string needle_;
         bool needle_case_ = false;
         bool matches_dirty_ = false;
