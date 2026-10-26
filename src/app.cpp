@@ -1,7 +1,5 @@
 #include "app.h"
 #include "ini.h"
-#include <limits>
-#include <windef.h>
 
 #define IMGUI_DEFINE_MATH_OPERATORS
 #include "imgui.h"
@@ -20,7 +18,9 @@
 #include <cstring>
 #include <dwmapi.h>
 #include <format>
+#include <limits>
 #include <shellapi.h>
+#include <windef.h>
 #include <windowsx.h>
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);

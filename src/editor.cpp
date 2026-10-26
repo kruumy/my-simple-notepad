@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstddef>
 #include <format>
 #include <limits>
 #include <numbers>
@@ -398,7 +399,7 @@ namespace simple_notepad
                 : 0.0f;
         const float fresh_width = unwrapped ? std::ranges::max(fresh, {}, &row::width).width : 0.0f;
         // typing inside a line keeps its row count, so the rows after it needn't move in memory
-        const auto old_count = static_cast<size_t>(r1 - r0 + 1);
+        const size_t old_count = r1 - r0 + 1;
         if (fresh.size() > old_count)
         {
             rows_.insert(rows_.begin() + r1 + 1, fresh.size() - old_count, row{});
