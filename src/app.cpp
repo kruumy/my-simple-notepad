@@ -39,6 +39,8 @@ namespace simple_notepad
     constexpr double MODAL_FADE_SECONDS = 0.06;
     // notepad++'s limit too; the editor keeps int offsets
     constexpr std::uintmax_t MAX_FILE_BYTES = std::numeric_limits<int>::max();
+    // rewrapping costs about 1 ms per MB on every zoom or resize step, so bigger files stay unwrapped
+    constexpr size_t MAX_WRAP_BYTES = static_cast<const size_t>(16 * 1024 * 1024);
     constexpr ImVec4 CLEAR_COLOR{0.122f, 0.122f, 0.122f, 1.0f};
     constexpr COLORREF WINDOW_BRUSH = RGB(31, 31, 31);
 
@@ -348,6 +350,10 @@ namespace simple_notepad
 
         switch (msg)
         {
+        case WM_ENTERSIZEMOVE:
+        case WM_EXITSIZEMOVE:
+            sizing_ = msg == WM_ENTERSIZEMOVE; // rewrapping a big file every frame of a drag would stall it
+            return 0;
         case WM_SIZE:
             if (wparam != SIZE_MINIMIZED)
             {
@@ -449,6 +455,11 @@ namespace simple_notepad
     bool app::dirty() const
     {
         return format_changed_ || editor_.state() != saved_state_;
+    }
+
+    bool app::can_wrap() const
+    {
+        return editor_.byte_count() <= MAX_WRAP_BYTES;
     }
 
     void app::frame()
@@ -582,7 +593,7 @@ namespace simple_notepad
         if (open_find || open_replace)
         {
             const auto [lo, hi] = editor_.selection();
-            const std::string_view selected = std::string_view(editor_.text()).substr(lo, hi - lo);
+            const std::string_view selected = editor_.text(lo, hi);
             if (!selected.empty() && selected.find('\n') == std::string_view::npos)
             {
                 find_text_ = selected;
@@ -623,7 +634,15 @@ namespace simple_notepad
         }
         if (ImGui::Shortcut(ImGuiMod_Alt | ImGuiKey_Z, global))
         {
-            settings_.wrap = !settings_.wrap;
+            if (can_wrap())
+            {
+                settings_.wrap = !settings_.wrap;
+            }
+            else
+            {
+                show_toast(std::format("Word wrap is off for files over {} MB",
+                                       MAX_WRAP_BYTES / (static_cast<size_t>(1024 * 1024))));
+            }
         }
     }
 
@@ -683,7 +702,16 @@ namespace simple_notepad
             }
             if (ImGui::BeginMenu("View"))
             {
-                ImGui::MenuItem("Word Wrap", "Alt+Z", &settings_.wrap);
+                if (can_wrap())
+                {
+                    ImGui::MenuItem("Word Wrap", "Alt+Z", &settings_.wrap);
+                }
+                else
+                {
+                    ImGui::MenuItem("Word Wrap", "Alt+Z", false, false);
+                    ImGui::SetItemTooltip("Off for files over %zu MB, so zooming and resizing stay fast",
+                                          MAX_WRAP_BYTES / (static_cast<size_t>(1024 * 1024)));
+                }
                 ImGui::MenuItem("Minimap", nullptr, &settings_.minimap);
                 if (ImGui::MenuItem("Syntax Highlighting", nullptr, &settings_.highlight))
                 {
@@ -982,12 +1010,13 @@ namespace simple_notepad
         editor_.draw({
             .font = editor_font_,
             .font_size = std::round(EDITOR_FONT_SIZE * settings_.zoom),
-            .wrap = settings_.wrap,
+            .wrap = settings_.wrap && can_wrap(),
             .minimap = settings_.minimap,
             .dpi = dpi_scale_,
             .height = ImGui::GetContentRegionAvail().y - status_height,
             .show_matches = find_open_,
             .scale = zoom_shown_ / settings_.zoom,
+            .hold_wrap = sizing_,
         });
     }
 
@@ -1032,7 +1061,7 @@ namespace simple_notepad
         // estimated: converting the text every frame is too slow for big files, and utf-16 ignores surrogates
         const auto chars = static_cast<std::uint64_t>(editor_.char_count());
         const auto line_breaks = doc_.crlf ? static_cast<std::uint64_t>(editor_.line_count() - 1) : 0; // each \r
-        std::uint64_t bytes = editor_.text().size() + line_breaks;
+        std::uint64_t bytes = editor_.byte_count() + line_breaks;
         switch (doc_.encoding)
         {
         case text_encoding::utf8_bom:
@@ -1251,8 +1280,7 @@ namespace simple_notepad
         }
         try
         {
-            const text_file out{.text = editor_.text(), .encoding = doc_.encoding, .crlf = doc_.crlf};
-            out.save(path_);
+            text_file::save(path_, editor_.text_runs(), doc_.encoding, doc_.crlf);
             saved_state_ = editor_.state();
             format_changed_ = false;
             show_toast("Saved");
@@ -1328,7 +1356,7 @@ namespace simple_notepad
             return;
         }
         editor_.set_search(find_text_, match_case_);
-        const std::string& text = editor_.text();
+        const std::string_view text = editor_.text();
         std::string result;
         result.reserve(text.size());
         size_t from = 0;
@@ -1351,15 +1379,15 @@ namespace simple_notepad
             return;
         }
         result.append(text, from);
-        editor_.replace_all(result);
+        editor_.replace_all(std::move(result));
         show_toast(std::format("Replaced {} occurrence{} (Ctrl+Z to undo)", replaced, replaced == 1 ? "" : "s"));
     }
 
     void app::format_json()
     {
-        const std::string& text = editor_.text();
+        const std::string_view text = editor_.text();
         const size_t first = text.find_first_not_of(" \t\r\n");
-        if (first == std::string::npos || (text[first] != '{' && text[first] != '['))
+        if (first == std::string_view::npos || (text[first] != '{' && text[first] != '['))
         {
             show_toast("Not JSON: the document must start with { or [");
             return;
@@ -1370,7 +1398,7 @@ namespace simple_notepad
             show_toast("Not valid JSON: brackets or quotes don't balance");
             return;
         }
-        editor_.replace_all(result);
+        editor_.replace_all(std::move(result));
         show_toast("Formatted JSON (Ctrl+Z to undo)");
     }
 

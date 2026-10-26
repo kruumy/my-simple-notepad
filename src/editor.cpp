@@ -8,6 +8,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstddef>
+#include <cstring>
 #include <format>
 #include <limits>
 #include <numbers>
@@ -34,8 +35,10 @@ namespace simple_notepad
     constexpr float FADE_RISE = 4.0f; // new characters float up into place by this many pixels
     constexpr size_t MAX_FADE_BYTES = 4096;
     constexpr float PIXEL_SNAP = 0.5f;
-    constexpr int MAX_ROW_BYTES = 10000;                    // unwrapped lines break here too, like windows notepad
-    constexpr ImU32 MATCH_COLOR = IM_COL32(234, 92, 0, 85); // vs code's find highlight
+    constexpr int MAX_ROW_BYTES = 10000;                      // unwrapped lines break here too, like windows notepad
+    constexpr int NO_LIMIT = std::numeric_limits<int>::max(); // max_end for a row free to run to its line end
+    constexpr size_t MAX_REFLOW_ROWS = 64;                    // rows an edit rewraps before it settles for a short one
+    constexpr ImU32 MATCH_COLOR = IM_COL32(234, 92, 0, 85);   // vs code's find highlight
     constexpr ImU32 MATCH_MARK_COLOR = IM_COL32(209, 134, 22, 255);
     constexpr int MAX_HIGHLIGHT_BYTES = 200 * 1024 * 1024; // notepad++'s default large file restriction
     // vs code dark modern, indexed by syntax::token
@@ -65,11 +68,17 @@ namespace simple_notepad
         return (std::isalnum(u) != 0 || c == '_' || u >= 0x80) ? 1 : 2;
     }
 
+    static int utf8_length(std::string_view s)
+    {
+        return static_cast<int>(std::ranges::count_if(s, [](char c) { return (c & 0xC0) != 0x80; }));
+    }
+
     // ---------------------------------------------------------------- public
 
     void editor::set_text(std::string text)
     {
-        text_ = std::move(text);
+        text_ = gap_buffer<std::string>(std::move(text));
+        column_pos_ = -1;
         fades_.clear();
         matches_dirty_ = true;
         spans_dirty_ = true;
@@ -82,10 +91,10 @@ namespace simple_notepad
         focus_request_ = true;
     }
 
-    void editor::replace_all(const std::string& text)
+    void editor::replace_all(std::string text)
     {
         const int caret = caret_;
-        apply(0, static_cast<int>(text_.size()), text, merge::none);
+        apply(0, static_cast<int>(text_.size()), std::move(text), merge::none);
         caret_ = anchor_ = std::min(caret, static_cast<int>(text_.size()));
         focus_request_ = true;
     }
@@ -93,7 +102,7 @@ namespace simple_notepad
     void editor::insert(std::string_view text)
     {
         const auto [lo, hi] = selection();
-        apply(lo, hi - lo, text, merge::none);
+        apply(lo, hi - lo, std::string(text), merge::none);
     }
 
     void editor::select(int start, int end)
@@ -123,10 +132,19 @@ namespace simple_notepad
 
     int editor::column() const
     {
-        const size_t found = caret_ == 0 ? std::string::npos : text_.rfind('\n', caret_ - 1);
-        const auto start = text_.begin() + (found == std::string::npos ? 0 : static_cast<int>(found) + 1);
-        return 1 + static_cast<int>(
-                       std::count_if(start, text_.begin() + caret_, [](char c) { return (c & 0xC0) != 0x80; }));
+        if (column_pos_ >= 0)
+        {
+            const std::string_view between = text_.view(std::min(column_pos_, caret_), std::max(column_pos_, caret_));
+            if (between.find('\n') == std::string_view::npos)
+            {
+                column_chars_ += caret_ >= column_pos_ ? utf8_length(between) : -utf8_length(between);
+                column_pos_ = caret_;
+                return 1 + column_chars_;
+            }
+        }
+        column_chars_ = utf8_length(text_.view(line_start(caret_), caret_));
+        column_pos_ = caret_;
+        return 1 + column_chars_;
     }
 
     void editor::set_search(std::string_view needle, bool match_case)
@@ -158,7 +176,7 @@ namespace simple_notepad
     {
         const auto [lo, hi] = selection();
         const auto equal = [this](char a, char b) { return same_char(a, b); };
-        return !needle_.empty() && std::ranges::equal(std::string_view(text_).substr(lo, hi - lo), needle_, equal);
+        return !needle_.empty() && std::ranges::equal(text_.view(lo, hi), needle_, equal);
     }
 
     bool editor::contains_needle(std::string_view s) const
@@ -167,31 +185,27 @@ namespace simple_notepad
         return !needle_.empty() && !std::ranges::search(s, needle_, equal).empty();
     }
 
+    // each half searches only its own range, so the gap at the caret seldom has to move
     std::optional<size_t> editor::search(size_t from, bool backward) const
     {
-        const std::string_view text = text_;
-        const std::string_view needle = needle_;
+        const size_t size = text_.size();
+        const size_t n = needle_.size();
+        from = std::min(from, size);
         const auto equal = [this](char a, char b) { return same_char(a, b); };
-
+        const auto find_in = [&](size_t a, size_t b) -> std::optional<size_t> {
+            const std::string_view range = text_.view(a, b);
+            const auto hit =
+                backward ? std::ranges::find_end(range, needle_, equal) : std::ranges::search(range, needle_, equal);
+            return hit.empty() ? std::nullopt : std::optional(a + static_cast<size_t>(hit.begin() - range.begin()));
+        };
+        // wrapping around: no hit lies wholly on the searched side, so one ending past from is the only kind left
         if (backward)
         {
-            const auto head = text.substr(0, std::min(from, text.size()));
-            const auto hit = std::ranges::find_end(head, needle, equal);
-            if (!hit.empty())
-            {
-                return static_cast<size_t>(hit.begin() - head.begin());
-            }
-            const auto wrapped = std::ranges::find_end(text, needle, equal);
-            return wrapped.empty() ? std::nullopt : std::optional(static_cast<size_t>(wrapped.begin() - text.begin()));
+            const auto hit = find_in(0, from);
+            return hit ? hit : find_in(from + 1 > n ? from + 1 - n : 0, size);
         }
-        const auto tail = text.substr(std::min(from, text.size()));
-        const auto hit = std::ranges::search(tail, needle, equal);
-        if (!hit.empty())
-        {
-            return from + static_cast<size_t>(hit.begin() - tail.begin());
-        }
-        const auto wrapped = std::ranges::search(text, needle, equal);
-        return wrapped.empty() ? std::nullopt : std::optional(static_cast<size_t>(wrapped.begin() - text.begin()));
+        const auto hit = find_in(from, size);
+        return hit ? hit : find_in(0, std::min(size, from + n - 1));
     }
 
     std::pair<int, int> editor::match_status()
@@ -236,7 +250,7 @@ namespace simple_notepad
     float editor::measure(int start, int end) const
     {
         float x = 0.0f;
-        const char* s = text_.data();
+        const char* s = text_.contiguous(start, end);
         // raw loop: utf-8 decoding steps a variable number of bytes
         for (int p = start; p < end;)
         {
@@ -254,49 +268,78 @@ namespace simple_notepad
         return x;
     }
 
-    // appends the visual rows of the line starting at line_start; appending avoids a vector per line
-    void editor::layout_line(int line_start, int line, std::vector<row>& out) const
+    // huge unwrapped lines split into rows too, since float x loses whole pixels far out
+    editor::row editor::next_row(int start, int line, bool first, int max_end) const
     {
-        const size_t found = text_.find('\n', line_start);
-        const int line_end = found == std::string::npos ? static_cast<int>(text_.size()) : static_cast<int>(found);
+        const int size = static_cast<int>(text_.size());
+        const int reach = std::min({size, start + (2 * MAX_ROW_BYTES), max_end > start ? max_end : NO_LIMIT});
+        const int window_end = std::min(size, reach + 3); // room to finish a character cut at the limit
+        const char* s = text_.contiguous(start, window_end);
+        row r{.start = start, .end = reach, .line = line, .first = first, .width = 0.0f};
         if (layout_wrap_width_ < 0.0f)
         {
-            // huge lines still split into rows: float x loses whole pixels far out, and short rows stay cheap
-            for (int row_start = line_start;;) // raw loop: one row per MAX_ROW_BYTES
+            const auto* newline = static_cast<const char*>(std::memchr(s + start, '\n', reach - start));
+            // a row takes up to two rows' worth before splitting, so typing into a full row never leaves a sliver
+            const int limit = reach < start + (2 * MAX_ROW_BYTES) ? reach : start + MAX_ROW_BYTES;
+            r.end = newline != nullptr ? static_cast<int>(newline - s) : limit;
+            while (newline == nullptr && r.end < window_end && (s[r.end] & 0xC0) == 0x80) // whole characters only
             {
-                int end = std::min(line_end, row_start + MAX_ROW_BYTES);
-                while (end < line_end && (text_[end] & 0xC0) == 0x80) // whole characters only
+                ++r.end;
+            }
+            r.width = measure(start, r.end) / layout_size_;
+            return r;
+        }
+
+        // wrapped rows end long before reach, so the scans below find the newline themselves
+        if (mono_advance_ > 0.0f)
+        {
+            // monospace ascii: what fits is a count, so only the bytes need checking
+            const int stop = std::min(reach, start + std::max(1, static_cast<int>(layout_wrap_width_ / mono_advance_)));
+            int last_space = -1;
+            int p = start;
+            // raw loop: stops at the first byte that needs the full measure below
+            for (; p < stop; ++p)
+            {
+                const char c = s[p];
+                if (c == '\n')
                 {
-                    ++end;
+                    r.end = p;
+                    return r;
                 }
-                out.push_back({row_start, end, line, row_start == line_start, measure(row_start, end)});
-                if (end == line_end)
+                if (c < ' ' || c > '~')
                 {
-                    return;
+                    break;
                 }
-                row_start = end;
+                last_space = c == ' ' ? p : last_space;
+            }
+            if (p == stop && (stop == reach || s[stop] == '\n'))
+            {
+                r.end = stop;
+                return r;
+            }
+            if (p == stop && s[stop] >= ' ' && s[stop] <= '~')
+            {
+                r.end = last_space >= start ? last_space + 1 : stop; // the overflowing character starts the next row
+                return r;
             }
         }
-        const char* s = text_.data();
-        int row_start = line_start;
         int last_break = -1;
-        bool first = true;
         float x = 0.0f;
-        // raw loop: greedily breaks the line at the last space that fits
-        for (int p = line_start; p < line_end;)
+        int p = start;
+        // raw loop: greedily breaks the row at the last space that fits
+        while (p < reach)
         {
             unsigned int c = static_cast<unsigned char>(s[p]);
-            const int len = c < 128 ? 1 : ImTextCharFromUtf8(&c, s + p, s + line_end); // ascii skips the decoder
-            float w = advance(c, x);
-            if (x + w > layout_wrap_width_ && p > row_start)
+            if (c == '\n')
             {
-                const int at = last_break > row_start ? last_break : p;
-                out.push_back({.start = row_start, .end = at, .line = line, .first = first, .width = 0.0f});
-                first = false;
-                row_start = at;
-                last_break = -1;
-                x = measure(row_start, p);
-                w = advance(c, x);
+                break;
+            }
+            const int len = c < 128 ? 1 : ImTextCharFromUtf8(&c, s + p, s + window_end); // ascii skips the decoder
+            const float w = advance(c, x);
+            if (x + w > layout_wrap_width_ && p > start)
+            {
+                r.end = last_break > start ? last_break : p;
+                return r;
             }
             x += w;
             if (c == ' ' || c == '\t')
@@ -305,42 +348,46 @@ namespace simple_notepad
             }
             p += len;
         }
-        out.push_back({.start = row_start, .end = line_end, .line = line, .first = first, .width = 0.0f});
+        r.end = p;
+        return r;
+    }
+
+    editor::row editor::row_after(const row& r, int max_end) const
+    {
+        const bool first = text_[r.end] == '\n';
+        return next_row(first ? r.end + 1 : r.end, first ? r.line + 1 : r.line, first, max_end);
     }
 
     void editor::rebuild_layout(float wrap_width)
     {
         layout_dirty_ = false;
         layout_wrap_width_ = wrap_width;
-        rows_.clear();
-        int line = 0;
-        // raw loop: walks the text line by line
-        for (int line_start = 0;; ++line)
+        ++revision_;
+        const int size = static_cast<int>(text_.size());
+        std::vector<row> rows{next_row(0, 0, true, NO_LIMIT)};
+        while (rows.back().end < size)
         {
-            layout_line(line_start, line, rows_);
-            if (std::cmp_greater_equal(rows_.back().end, text_.size()))
-            {
-                break;
-            }
-            line_start = rows_.back().end + 1;
+            rows.push_back(row_after(rows.back(), NO_LIMIT));
         }
-        line_count_ = line + 1;
-        char_count_ = static_cast<int>(std::ranges::count_if(text_, [](char c) { return (c & 0xC0) != 0x80; }));
+        line_count_ = rows.back().line + 1;
+        rows_ = decltype(rows_)(std::move(rows));
+        char_count_ = utf8_length(text_.view(0, text_.size()));
         update_content_width();
     }
 
-    // edits relayout only the lines they touch and shift the rows after them
+    // edits relayout only the rows they touch, until a row starts where an old one did; the rest shift in one step
     void editor::replace_text(int pos, int remove, std::string_view insert)
     {
-        const auto chars = [](std::string_view s) {
-            return static_cast<int>(std::ranges::count_if(s, [](char c) { return (c & 0xC0) != 0x80; }));
-        };
-        matches_dirty_ = true;
-        const int new_size = static_cast<int>(text_.size() + insert.size()) - remove;
+        ++revision_;
+        const int delta = static_cast<int>(insert.size()) - remove;
+        const int new_size = static_cast<int>(text_.size()) + delta;
         if (std::max(static_cast<int>(text_.size()), new_size) > MAX_HIGHLIGHT_BYTES)
         {
             spans_dirty_ = true; // crossing the limit either way needs a full pass
         }
+        // untouched bytes between two edits join the range too, and a line break among them can't be tracked
+        edited_.joined =
+            edited_.joined || (edited_.start >= 0 && (pos > edited_.new_end || pos + remove < edited_.start));
         // widen the range edited since the last scan; bytes after it only shifted
         const int inserted_end = pos + static_cast<int>(insert.size());
         edited_.new_end = edited_.start < 0 || edited_.new_end < pos + remove
@@ -352,68 +399,82 @@ namespace simple_notepad
         std::ranges::for_each(fades_, [&](fade& f) {
             if (f.start >= pos)
             {
-                f.start += static_cast<int>(insert.size()) - remove;
-                f.end += static_cast<int>(insert.size()) - remove;
+                f.start += delta;
+                f.end += delta;
             }
         });
+        const std::string_view removed = text_.view(pos, pos + remove);
+        edited_.joined = edited_.joined || removed.find('\n') != std::string_view::npos;
+        char_count_ += utf8_length(insert) - utf8_length(removed);
+        // the counted column holds through edits after it and follows ones that end at it on its line
+        if (column_pos_ > pos)
+        {
+            const bool follows = pos + remove == column_pos_ && removed.find('\n') == std::string_view::npos &&
+                                 insert.find('\n') == std::string_view::npos;
+            column_chars_ += follows ? utf8_length(insert) - utf8_length(removed) : 0;
+            column_pos_ = follows ? column_pos_ + delta : -1;
+        }
         if (layout_dirty_)
         {
             text_.replace(pos, remove, insert);
+            update_matches(pos, remove, static_cast<int>(insert.size()));
             return;
         }
+
+        const bool unwrapped = layout_wrap_width_ < 0.0f;
         int r0 = row_of(pos);
-        while (r0 > 0 && !rows_[r0].first)
+        // greedy wrap: a shortened word may now fit one row up; rarer ripples further back wait for a full layout
+        if (!unwrapped && r0 > 0 && !rows_[r0].first)
         {
             --r0;
         }
-        int r1 = row_of(pos + remove);
-        while (r1 + 1 < static_cast<int>(rows_.size()) && !rows_[r1 + 1].first)
-        {
-            ++r1;
-        }
-        const int old_last_line = rows_[r1].line;
-        const int delta = static_cast<int>(insert.size()) - remove;
-        const int region_end = rows_[r1].end + delta;
-
-        char_count_ += chars(insert) - chars(std::string_view(text_).substr(pos, remove));
+        // unwrapped rows don't depend on each other, so new ones stop where the last edited row ended
+        const int max_end = unwrapped ? rows_[row_of(pos + remove)].end + delta : NO_LIMIT;
+        const row old = rows_[r0];
         text_.replace(pos, remove, insert);
+        update_matches(pos, remove, static_cast<int>(insert.size()));
 
-        std::vector<row> fresh;
-        int line = rows_[r0].line;
-        // raw loop: relayouts each touched line
-        for (int line_start = rows_[r0].start;; ++line)
+        const int size = static_cast<int>(text_.size());
+        std::vector<row> fresh{next_row(old.start, old.line, old.first, max_end)};
+        size_t sync = rows_.size(); // first old row that still holds, once shifted
+        int line_delta = 0;
+        // raw loop: lays out rows until one starts past the edit where an old row did
+        while (fresh.back().end < size)
         {
-            layout_line(line_start, line, fresh);
-            if (fresh.back().end >= region_end)
+            int cap = max_end;
+            if (std::cmp_greater_equal(fresh.size(), MAX_REFLOW_ROWS) && fresh.back().end >= inserted_end)
             {
-                break;
+                // a wrapped line with no spaces would reflow to its end: one row ends short at an old break instead
+                const int was = fresh.back().end - delta;
+                const size_t k = rows_.partition_point([&](const row& r) { return r.start <= was; });
+                cap = k < rows_.size() ? rows_[k].start + delta : NO_LIMIT;
             }
-            line_start = fresh.back().end + 1;
+            const row next = row_after(fresh.back(), cap);
+            if (next.start >= inserted_end)
+            {
+                const int was = next.start - delta;
+                const size_t k = rows_.partition_point([&](const row& r) { return r.start < was; });
+                if (k < rows_.size() && rows_[k].start == was && rows_[k].first == next.first)
+                {
+                    sync = k;
+                    line_delta = next.line - rows_[k].line;
+                    break;
+                }
+            }
+            fresh.push_back(next);
         }
-        const int line_delta = line - old_last_line;
-        const bool unwrapped = layout_wrap_width_ < 0.0f;
-        const float removed_width =
-            unwrapped
-                ? std::ranges::max(std::ranges::subrange(rows_.begin() + r0, rows_.begin() + r1 + 1), {}, &row::width)
-                      .width
-                : 0.0f;
-        const float fresh_width = unwrapped ? std::ranges::max(fresh, {}, &row::width).width : 0.0f;
-        // typing inside a line keeps its row count, so the rows after it needn't move in memory
-        const size_t old_count = r1 - r0 + 1;
-        if (fresh.size() > old_count)
+        if (sync == rows_.size())
         {
-            rows_.insert(rows_.begin() + r1 + 1, fresh.size() - old_count, row{});
+            line_delta = fresh.back().line + 1 - line_count_;
         }
-        else if (fresh.size() < old_count)
+        float removed_width = 0.0f;
+        for (size_t r = r0; unwrapped && r < sync; ++r) // raw loop: the gap buffer has no iterators
         {
-            rows_.erase(rows_.begin() + r0 + static_cast<int>(fresh.size()), rows_.begin() + r1 + 1);
+            removed_width = std::max(removed_width, rows_[r].width * layout_size_);
         }
-        std::ranges::copy(fresh, rows_.begin() + r0);
-        std::for_each(rows_.begin() + r0 + static_cast<int>(fresh.size()), rows_.end(), [&](row& r) {
-            r.start += delta;
-            r.end += delta;
-            r.line += line_delta;
-        });
+        const float fresh_width = unwrapped ? std::ranges::max(fresh, {}, &row::width).width * layout_size_ : 0.0f;
+        rows_.replace(r0, sync - r0, fresh);
+        rows_.shift_tail({.bytes = delta, .lines = line_delta});
         line_count_ += line_delta;
         // only a full rescan finds the next widest row once the widest one shrinks
         if (!unwrapped || fresh_width >= content_width_)
@@ -449,16 +510,72 @@ namespace simple_notepad
         }
     }
 
+    // known limit: with a self-overlapping needle ("aa") this can keep another valid set than a full search
+    void editor::update_matches(int pos, int remove, int inserted)
+    {
+        if (matches_dirty_ || needle_.empty())
+        {
+            return;
+        }
+        if (matches_capped_)
+        {
+            matches_dirty_ = true; // the edit moves where the cap cuts off
+            return;
+        }
+        const int n = static_cast<int>(needle_.size());
+        const int delta = inserted - remove;
+        // matches starting from n - 1 bytes before the edit up to its end overlap the edited bytes
+        const auto first = std::ranges::lower_bound(matches_, pos - n + 1, {}, &std::pair<int, int>::first);
+        const auto last =
+            std::ranges::lower_bound(first, matches_.end(), pos + remove, {}, &std::pair<int, int>::first);
+        std::for_each(last, matches_.end(), [&](std::pair<int, int>& m) {
+            m.first += delta;
+            m.second += delta;
+        });
+        const int from = std::max(pos - n + 1, first == matches_.begin() ? 0 : std::prev(first)->second);
+        const int to =
+            std::min(last == matches_.end() ? static_cast<int>(text_.size()) : last->first, pos + inserted + n - 1);
+        const std::string_view window = from < to ? text_.view(from, to) : std::string_view{};
+        const auto equal = [this](char a, char b) { return same_char(a, b); };
+        std::vector<std::pair<int, int>> found;
+        // raw loop: each hit resumes the search after itself
+        for (size_t at = 0;;)
+        {
+            const std::string_view rest = window.substr(at);
+            const auto hit = std::ranges::search(rest, needle_, equal);
+            if (hit.empty())
+            {
+                break;
+            }
+            const int start = from + static_cast<int>(at + (hit.begin() - rest.begin()));
+            found.emplace_back(start, start + n);
+            at = static_cast<size_t>(start + n - from);
+        }
+        matches_.insert(matches_.erase(first, last), found.begin(), found.end());
+        if (std::cmp_greater(matches_.size(), MAX_MATCHES))
+        {
+            matches_.resize(MAX_MATCHES);
+            matches_capped_ = true;
+        }
+    }
+
     void editor::update_content_width()
     {
-        content_width_ =
-            layout_wrap_width_ < 0.0f ? std::ranges::max(rows_, {}, &row::width).width : layout_wrap_width_;
+        content_width_ = layout_wrap_width_;
+        if (layout_wrap_width_ < 0.0f)
+        {
+            content_width_ = 0.0f;
+            for (size_t r = 0; r < rows_.size(); ++r) // raw loop: the gap buffer has no iterators
+            {
+                content_width_ = std::max(content_width_, rows_[r].width * layout_size_);
+            }
+        }
     }
 
     int editor::row_of(int pos) const
     {
-        const auto it = std::ranges::upper_bound(rows_, pos, {}, &row::start);
-        return std::max(0, static_cast<int>(it - rows_.begin()) - 1);
+        const size_t after = rows_.partition_point([&](const row& r) { return r.start <= pos; });
+        return std::max(0, static_cast<int>(after) - 1);
     }
 
     float editor::x_of(int pos) const
@@ -468,8 +585,8 @@ namespace simple_notepad
 
     int editor::pos_at(int row_index, float x) const
     {
-        const row& r = rows_[std::clamp(row_index, 0, static_cast<int>(rows_.size()) - 1)];
-        const char* s = text_.data();
+        const row r = rows_[std::clamp(row_index, 0, static_cast<int>(rows_.size()) - 1)];
+        const char* s = text_.contiguous(r.start, r.end);
         float cx = 0.0f;
         // raw loop: utf-8 decoding steps a variable number of bytes
         for (int p = r.start; p < r.end;)
@@ -591,15 +708,34 @@ namespace simple_notepad
 
     std::pair<int, int> editor::line_at(int pos) const
     {
-        const size_t before = pos == 0 ? std::string::npos : text_.rfind('\n', pos - 1);
-        const size_t after = text_.find('\n', pos);
-        return {before == std::string::npos ? 0 : static_cast<int>(before) + 1,
-                after == std::string::npos ? static_cast<int>(text_.size()) : static_cast<int>(after) + 1};
+        const int end = line_end(pos);
+        return {line_start(pos), std::cmp_less(end, text_.size()) ? end + 1 : end};
+    }
+
+    // the rows already know where lines break, so no byte scan is needed
+    int editor::line_start(int pos) const
+    {
+        int r = row_of(pos);
+        while (r > 0 && !rows_[r].first)
+        {
+            --r;
+        }
+        return rows_[r].start;
+    }
+
+    int editor::line_end(int pos) const
+    {
+        int r = row_of(pos);
+        while (r + 1 < static_cast<int>(rows_.size()) && !rows_[r + 1].first)
+        {
+            ++r;
+        }
+        return rows_[r].end;
     }
 
     // ---------------------------------------------------------------- editing
 
-    void editor::apply(int pos, int remove, std::string_view insert, merge kind)
+    void editor::apply(int pos, int remove, std::string insert, merge kind)
     {
         if (text_.size() - remove + insert.size() > static_cast<size_t>(std::numeric_limits<int>::max()))
         {
@@ -607,6 +743,9 @@ namespace simple_notepad
         }
         const double now = ImGui::GetTime();
         const std::uint64_t id = next_id_++;
+        const int inserted = static_cast<int>(insert.size());
+        std::string removed(text_.view(pos, pos + remove));
+        replace_text(pos, remove, insert);
         bool merged = false;
         if (kind != merge::none && !undo_.empty())
         {
@@ -623,7 +762,6 @@ namespace simple_notepad
             else if (recent && kind == merge::deleting && insert.empty() && last.inserted.empty() &&
                      (pos + remove == last.pos || pos == last.pos))
             {
-                const std::string removed = text_.substr(pos, remove);
                 last.removed = pos == last.pos ? last.removed + removed : removed + last.removed;
                 last.pos = pos;
                 merged = true;
@@ -636,18 +774,17 @@ namespace simple_notepad
         }
         if (!merged)
         {
-            undo_.push_back({pos, text_.substr(pos, remove), std::string(insert), caret_, anchor_, kind, now, id});
+            undo_.push_back({pos, std::move(removed), std::move(insert), caret_, anchor_, kind, now, id});
             if (undo_.size() > MAX_UNDO)
             {
                 undo_.pop_front();
             }
         }
         redo_.clear();
-        replace_text(pos, remove, insert);
-        move_caret(pos + static_cast<int>(insert.size()), false);
-        if (!insert.empty() && insert.size() <= MAX_FADE_BYTES)
+        move_caret(pos + inserted, false);
+        if (inserted > 0 && std::cmp_less_equal(inserted, MAX_FADE_BYTES))
         {
-            fades_.push_back({.start = pos, .end = pos + static_cast<int>(insert.size()), .time = now});
+            fades_.push_back({.start = pos, .end = pos + inserted, .time = now});
         }
     }
 
@@ -723,7 +860,7 @@ namespace simple_notepad
             std::array<char, 5> utf8{};
             const int len = ImTextCharToUtf8(utf8.data(), c);
             const auto [a, b] = selection();
-            apply(a, b - a, std::string_view(utf8.data(), len), merge::typing);
+            apply(a, b - a, std::string(utf8.data(), len), merge::typing);
         }
         io.InputQueueCharacters.resize(0);
 
@@ -777,7 +914,7 @@ namespace simple_notepad
             else
             {
                 // smart home: first press goes to the indentation, the next to the row start
-                const row& r = rows_[row_of(caret_)];
+                const row r = rows_[row_of(caret_)];
                 int indent = r.start;
                 while (r.first && indent < r.end && (text_[indent] == ' ' || text_[indent] == '\t'))
                 {
@@ -819,7 +956,7 @@ namespace simple_notepad
             {
                 std::string copied;
                 // raw loop: expands line endings for other windows apps in one pass
-                for (const char c : std::string_view(text_).substr(lo, hi - lo))
+                for (const char c : text_.view(lo, hi))
                 {
                     if (c == '\n')
                     {
@@ -840,7 +977,7 @@ namespace simple_notepad
             {
                 std::string pasted = clip;
                 std::erase(pasted, '\r');
-                apply(lo, hi - lo, pasted, merge::none);
+                apply(lo, hi - lo, std::move(pasted), merge::none);
             }
         }
         else if (ctrl && (pressed(ImGuiKey_Y) || (shift && pressed(ImGuiKey_Z))))
@@ -854,14 +991,14 @@ namespace simple_notepad
         else if (ctrl && pressed(ImGuiKey_D))
         {
             // duplicates every line the selection touches below itself and moves the selection onto the copy
-            const size_t nl = text_.rfind('\n', lo > 0 ? lo - 1 : std::string::npos);
-            const int start = lo > 0 && nl != std::string::npos ? static_cast<int>(nl) + 1 : 0;
-            const size_t found = text_.find('\n', hi);
-            const int end = found == std::string::npos ? static_cast<int>(text_.size()) : static_cast<int>(found);
+            const int start = line_start(lo);
+            const int end = line_end(hi);
             const int caret = caret_;
             const int anchor = anchor_;
             const int shift_by = end - start + 1;
-            apply(end, 0, "\n" + text_.substr(start, end - start), merge::none);
+            std::string copy(1, '\n');
+            copy += text_.view(start, end);
+            apply(end, 0, std::move(copy), merge::none);
             caret_ = caret + shift_by;
             anchor_ = anchor + shift_by;
         }
@@ -1003,7 +1140,17 @@ namespace simple_notepad
                 ascii_advance_[c] = baked->GetCharAdvance(static_cast<ImWchar>(c));
             }
             tab_width_ = ascii_advance_[' '] * 4.0f;
-            layout_dirty_ = true;
+            const auto [narrowest, widest] = std::minmax_element(&ascii_advance_[' '], &ascii_advance_['~'] + 1);
+            mono_advance_ = *narrowest == *widest ? *narrowest : 0.0f;
+            // unwrapped rows break at fixed byte counts and keep font-relative widths, so zoom only rescales
+            if (layout_wrap_width_ < 0.0f && !layout_dirty_)
+            {
+                update_content_width();
+            }
+            else
+            {
+                layout_dirty_ = true;
+            }
         }
 
         const float pad = PAD * dpi_;
@@ -1041,7 +1188,9 @@ namespace simple_notepad
         const float text_width = total_width - gutter_width - minimap_width;
         const float wrap_width =
             v.wrap ? std::max(text_width - (pad * 2.0f) - scrollbar, ascii_advance_['M'] * 8.0f) : -1.0f;
-        if (layout_dirty_ || wrap_width != layout_wrap_width_)
+        // a window being dragged to a new size rewraps once, when the drag ends
+        const bool held = v.hold_wrap && wrap_width >= 0.0f && layout_wrap_width_ >= 0.0f;
+        if (layout_dirty_ || (wrap_width != layout_wrap_width_ && !held))
         {
             rebuild_layout(wrap_width);
         }
@@ -1158,7 +1307,9 @@ namespace simple_notepad
         const bool highlight = language_ != nullptr && std::cmp_less_equal(text_.size(), MAX_HIGHLIGHT_BYTES);
         if (spans_dirty_)
         {
-            spans_ = highlight ? syntax::scan(*language_, text_) : std::vector<syntax::span>{};
+            ++revision_;
+            spans_ = syntax::span_buffer(highlight ? syntax::scan(*language_, text_.view(0, text_.size()))
+                                                   : std::vector<syntax::span>{});
         }
         else if (highlight && edited_.start >= 0)
         {
@@ -1166,6 +1317,7 @@ namespace simple_notepad
         }
         spans_dirty_ = false;
         edited_.start = -1;
+        edited_.joined = false;
         scanned_size_ = static_cast<int>(text_.size());
         // eased zoom: drawn under a widened clip so text scaling into view isn't culled, then the clip is restored
         const auto scale_drawn = [&](ImDrawList* dl, std::pair<int, int> since, ImVec2 pivot, ImVec4 clip) {
@@ -1240,7 +1392,7 @@ namespace simple_notepad
         const float text_offset = (lh - ImGui::GetFontSize()) * 0.5f;
         const ImU32 text_col = ImGui::GetColorU32(ImGuiCol_Text);
         const ImU32 select_col = ImGui::GetColorU32(ImGuiCol_TextSelectedBg);
-        const char* s = text_.data();
+        const char* s = nullptr; // the row being drawn, made whole one row at a time so the gap moves at most a row
         const double now = ImGui::GetTime();
         std::erase_if(fades_, [&](const fade& f) { return now - f.time >= FADE_SECONDS; });
 
@@ -1255,16 +1407,18 @@ namespace simple_notepad
                     ++cut;
                 }
                 ImU32 col = text_col;
-                if (const auto it = std::ranges::upper_bound(spans_, p, {}, &syntax::span::end); it != spans_.end())
+                if (const size_t i = spans_.partition_point([&](const syntax::span& sp) { return sp.end <= p; });
+                    i < spans_.size())
                 {
-                    if (it->start <= p)
+                    const syntax::span sp = spans_[i];
+                    if (sp.start <= p)
                     {
-                        cut = std::min(cut, it->end);
-                        col = TOKEN_COLORS[static_cast<size_t>(it->kind)];
+                        cut = std::min(cut, sp.end);
+                        col = TOKEN_COLORS[static_cast<size_t>(sp.kind)];
                     }
                     else
                     {
-                        cut = std::min(cut, it->start);
+                        cut = std::min(cut, sp.start);
                     }
                 }
                 float t = 1.0f;
@@ -1300,7 +1454,8 @@ namespace simple_notepad
                          : matches_.end();
         for (int r = first; r <= last; ++r) // raw loop: visible rows by index
         {
-            const row& w = rows_[r];
+            const row w = rows_[r];
+            s = text_.contiguous(w.start, w.end);
             const float y = origin_y + (static_cast<float>(r) * lh);
             // raw loop: walks the sorted matches alongside the rows; one wrapped across rows shows on each
             for (; match != matches_.end() && match->first < w.end; ++match)
@@ -1346,7 +1501,7 @@ namespace simple_notepad
             // raw loop: draws tab-separated runs so tab stops line up, until past the view's right edge
             while (p < w.end && origin_x + x <= inner.Max.x)
             {
-                const size_t tab = std::string_view(text_).substr(p, w.end - p).find('\t');
+                const size_t tab = std::string_view(s + p, w.end - p).find('\t');
                 const int q = tab == std::string_view::npos ? w.end : p + static_cast<int>(tab);
                 if (q > p)
                 {
@@ -1512,51 +1667,88 @@ namespace simple_notepad
         dl->PushClipRect({x, top_}, {x + width, top_ + height_}, true);
         dl->AddLine({x, top_}, {x, top_ + height_}, ImGui::GetColorU32(ImGuiCol_Border));
         const ImU32 ink = ImGui::GetColorU32(ImGuiCol_Text, 0.32f);
+        std::array<ImU32, TOKEN_COLORS.size()> faded{};
+        std::ranges::transform(TOKEN_COLORS, faded.begin(), [](ImU32 c) { return ImGui::GetColorU32(c, 0.6f); });
         const float left = x + (6.0f * dpi_);
         const float max_x = (width - (8.0f * dpi_)) / scale;
         const int last_row = static_cast<int>(rows_.size()) - 1;
         const int first = std::clamp(static_cast<int>(offset / row_h), 0, last_row);
         const int last = std::clamp(static_cast<int>((offset + height_) / row_h) + 1, 0, last_row);
-        const char* s = text_.data();
-        for (int r = first; r <= last; ++r) // raw loop: visible rows by index
+        // animation frames (caret, fades) redraw the same blocks, so they are only rebuilt when an input changes
+        const minimap_key key{.revision = revision_,
+                              .first = first,
+                              .last = last,
+                              .offset = offset,
+                              .left = left,
+                              .top = top_,
+                              .scale = scale,
+                              .max_x = max_x,
+                              .block_h = block_h,
+                              .ink = ink};
+        const bool rebuild = key != minimap_key_;
+        if (rebuild)
         {
-            const row& w = rows_[r];
+            minimap_key_ = key;
+            minimap_blocks_.clear();
+        }
+        for (int r = first; rebuild && r <= last; ++r) // raw loop: visible rows by index
+        {
+            const row w = rows_[r];
+            const char* s = text_.contiguous(w.start, w.end);
             const float y = std::round(top_ + (static_cast<float>(r) * row_h) - offset);
             float cx = 0.0f;
             float run = -1.0f;
-            // raw loop: merges each word into one block, like a zoomed-out view of the text
+            ImU32 run_col = ink;
+            // walked along with the text, so the spans are only read where the colour changes
+            size_t span = spans_.partition_point([&](const syntax::span& sp) { return sp.end <= w.start; });
+            ImU32 col = ink;
+            int col_until = w.start; // where col stops applying
+            // raw loop: merges each word into one block, like a zoomed-out view of the text; colours split blocks
             for (int p = w.start; p <= w.end && cx < max_x;)
             {
-                unsigned int c = ' ';
-                int len = 1;
-                if (p < w.end)
+                unsigned int c = p < w.end ? static_cast<unsigned char>(s[p]) : ' ';
+                const int len = c < 128 ? 1 : ImTextCharFromUtf8(&c, s + p, s + w.end); // ascii skips the decoder
+                if (p >= col_until)
                 {
-                    len = ImTextCharFromUtf8(&c, s + p, s + w.end);
+                    while (span < spans_.size() && spans_[span].end <= p)
+                    {
+                        ++span;
+                    }
+                    const syntax::span next =
+                        span < spans_.size()
+                            ? spans_[span]
+                            : syntax::span{.start = NO_LIMIT, .end = NO_LIMIT, .kind = syntax::token::comment};
+                    col = next.start <= p ? faded[static_cast<size_t>(next.kind)] : ink;
+                    col_until = next.start <= p ? next.end : next.start;
                 }
                 const bool blank = c == ' ' || c == '\t';
-                if (blank && run >= 0.0f)
+                if (run >= 0.0f && (blank || col != run_col))
                 {
-                    dl->AddRectFilled({left + (run * scale), y}, {left + (cx * scale), y + block_h}, ink);
+                    minimap_blocks_.push_back({left + (run * scale), y, left + (cx * scale), y + block_h, run_col});
                     run = -1.0f;
                 }
-                else if (!blank && run < 0.0f)
+                if (!blank && run < 0.0f)
                 {
                     run = cx;
+                    run_col = col;
                 }
                 cx += advance(c, cx);
                 p += len;
             }
             if (run >= 0.0f)
             {
-                dl->AddRectFilled({left + (run * scale), y}, {left + (std::min(cx, max_x) * scale), y + block_h}, ink);
+                minimap_blocks_.push_back(
+                    {left + (run * scale), y, left + (std::min(cx, max_x) * scale), y + block_h, run_col});
             }
         }
+        std::ranges::for_each(minimap_blocks_,
+                              [&](const minimap_block& b) { dl->AddRectFilled({b.x0, b.y0}, {b.x1, b.y1}, b.col); });
         auto match = show_matches_
                          ? std::ranges::upper_bound(matches_, rows_[first].start, {}, &std::pair<int, int>::second)
                          : matches_.end();
         for (int r = first; r <= last && match != matches_.end(); ++r) // raw loop: visible rows by index
         {
-            const row& w = rows_[r];
+            const row w = rows_[r];
             const float y = std::round(top_ + (static_cast<float>(r) * row_h) - offset);
             // raw loop: as in draw_text; at least 2 px wide so a short match still shows
             for (; match != matches_.end() && match->first < w.end; ++match)

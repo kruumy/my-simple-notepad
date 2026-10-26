@@ -107,47 +107,66 @@ namespace simple_notepad
         return file;
     }
 
-    void text_file::save(const std::filesystem::path& path) const
+    // utf-8 without crlf writes the runs as they are, so a big file isn't copied
+    void text_file::save(const std::filesystem::path& path, std::array<std::string_view, 2> body,
+                         text_encoding encoding, bool crlf)
     {
-        std::string body;
+        std::string expanded;
         if (crlf)
         {
-            body.reserve(text.size() + (text.size() / 32));
-            for (const char c : text) // raw loop: one-pass expansion is clearer than an algorithm here
+            expanded.reserve(body[0].size() + body[1].size() + ((body[0].size() + body[1].size()) / 32));
+            for (const std::string_view run : body)
             {
-                if (c == '\n')
+                // raw loop: copies the stretches between newlines whole
+                for (size_t from = 0;;)
                 {
-                    body += '\r';
+                    const size_t newline = run.find('\n', from);
+                    expanded.append(run.substr(from, newline - from));
+                    if (newline == std::string_view::npos)
+                    {
+                        break;
+                    }
+                    expanded += "\r\n";
+                    from = newline + 1;
                 }
-                body += c;
             }
-        }
-        else
-        {
-            body = text;
+            body = {expanded, {}};
         }
 
-        std::string bytes;
+        // conversions need the text as one run
+        std::string joined;
+        const auto one_run = [&]() -> std::string_view {
+            if (body[1].empty())
+            {
+                return body[0];
+            }
+            joined.reserve(body[0].size() + body[1].size());
+            joined.append(body[0]).append(body[1]);
+            return joined;
+        };
+        std::string_view prefix;
+        std::string converted;
         switch (encoding)
         {
         case text_encoding::utf8:
-            bytes = std::move(body);
             break;
         case text_encoding::utf8_bom:
-            bytes = "\xEF\xBB\xBF" + body;
+            prefix = "\xEF\xBB\xBF";
             break;
         case text_encoding::ansi:
-            bytes = from_wide(to_wide(body, CP_UTF8), CP_ACP);
+            converted = from_wide(to_wide(one_run(), CP_UTF8), CP_ACP);
+            body = {converted, {}};
             break;
         case text_encoding::utf16_le:
         case text_encoding::utf16_be: {
-            std::wstring wide = to_wide(body, CP_UTF8);
+            std::wstring wide = to_wide(one_run(), CP_UTF8);
             if (encoding == text_encoding::utf16_be)
             {
                 wide = swap_bytes(std::move(wide));
             }
-            bytes = encoding == text_encoding::utf16_le ? "\xFF\xFE" : "\xFE\xFF";
-            bytes.append(reinterpret_cast<const char*>(wide.data()), wide.size() * 2);
+            prefix = encoding == text_encoding::utf16_le ? "\xFF\xFE" : "\xFE\xFF";
+            converted.assign(reinterpret_cast<const char*>(wide.data()), wide.size() * 2);
+            body = {converted, {}};
             break;
         }
         }
@@ -157,7 +176,11 @@ namespace simple_notepad
         temp += L".~tmp";
         {
             std::ofstream out(temp, std::ios::binary | std::ios::trunc);
-            out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+            out.write(prefix.data(), static_cast<std::streamsize>(prefix.size()));
+            for (const std::string_view run : body)
+            {
+                out.write(run.data(), static_cast<std::streamsize>(run.size()));
+            }
             if (!out.flush())
             {
                 out.close();

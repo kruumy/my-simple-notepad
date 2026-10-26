@@ -69,4 +69,5 @@ Checks: >
   -misc-use-internal-linkage,
   -misc-use-anonymous-namespace,
   -google-runtime-int,
-  -abseil-string-find-str-contains
+  -abseil-string-find-str-contains,
+  -fuchsia-overloaded-operator

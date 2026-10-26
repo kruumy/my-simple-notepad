@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <string>
@@ -24,7 +25,9 @@ namespace simple_notepad
         bool crlf = true;
 
         static text_file load(const std::filesystem::path& path);
-        void save(const std::filesystem::path& path) const;
+        // body is written in order; two runs let the editor save without joining its text first
+        static void save(const std::filesystem::path& path, std::array<std::string_view, 2> body,
+                         text_encoding encoding, bool crlf);
 
         [[nodiscard]] static const char* encoding_name(text_encoding encoding);
         [[nodiscard]] static std::string to_utf8(std::wstring_view wide);

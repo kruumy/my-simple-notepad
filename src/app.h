@@ -12,7 +12,6 @@
 #include <wrl/client.h>
 
 struct ImFont;
-using ImU32 = unsigned int;
 
 namespace simple_notepad
 {
@@ -50,6 +49,7 @@ namespace simple_notepad
         bool running_ = true;
         bool focused_ = true;
         bool in_frame_ = false;
+        bool sizing_ = false; // the window edge is being dragged
         int frames_ = 3;
         float dpi_scale_ = 1.0f;
 
@@ -100,6 +100,7 @@ namespace simple_notepad
         void frame();
         [[nodiscard]] bool animating() const;
         [[nodiscard]] bool dirty() const;
+        [[nodiscard]] bool can_wrap() const; // false for files too big to rewrap on every zoom step
         [[nodiscard]] bool same_as_presented();
 
         void draw_menu();

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "gap_buffer.h"
 #include "syntax.h"
 #include <array>
 #include <cstdint>
@@ -30,14 +31,15 @@ namespace simple_notepad
             float height = 0.0f;
             bool show_matches = false; // highlights in the text and marks in the minimap
             float scale = 1.0f;        // an eased zoom draws the text at this size relative to font_size
+            bool hold_wrap = false;    // keeps the current wrap width, e.g. while the window is dragged to a new size
         };
 
         static constexpr int MAX_MATCHES = 20000; // bounds time and memory for a short needle in a huge file
 
         void draw(const view& v);
 
-        void set_text(std::string text);           // clears undo history
-        void replace_all(const std::string& text); // one undoable step
+        void set_text(std::string text);    // clears undo history
+        void replace_all(std::string text); // one undoable step
         void insert(std::string_view text);
         void select(int start, int end); // leaves focus where it is
         void focus();
@@ -53,9 +55,23 @@ namespace simple_notepad
         [[nodiscard]] bool selection_is_match() const;
         [[nodiscard]] bool contains_needle(std::string_view s) const;
 
-        [[nodiscard]] const std::string& text() const
+        // the whole text as one run, which moves the edit gap once; views stay valid until the next edit
+        [[nodiscard]] std::string_view text() const
         {
-            return text_;
+            return text_.view(0, text_.size());
+        }
+        [[nodiscard]] std::string_view text(int start, int end) const
+        {
+            return text_.view(start, end);
+        }
+        // the text as the two runs either side of the edit gap, for writing out without moving it
+        [[nodiscard]] std::array<std::string_view, 2> text_runs() const
+        {
+            return text_.runs();
+        }
+        [[nodiscard]] size_t byte_count() const
+        {
+            return text_.size();
         }
         [[nodiscard]] std::pair<int, int> selection() const; // ordered byte offsets
         [[nodiscard]] int line() const;
@@ -92,13 +108,36 @@ namespace simple_notepad
             lines,
         };
 
+        struct row_shift
+        {
+            int bytes;
+            int lines;
+
+            friend row_shift operator+(row_shift a, row_shift b)
+            {
+                return {.bytes = a.bytes + b.bytes, .lines = a.lines + b.lines};
+            }
+            friend row_shift operator-(row_shift a)
+            {
+                return {.bytes = -a.bytes, .lines = -a.lines};
+            }
+        };
+
         struct row
         {
             int start;
             int end; // excludes the newline
             int line;
-            bool first; // first visual row of its line
-            float width;
+            bool first;  // first visual row of its line
+            float width; // in font sizes when unwrapped, so zooming keeps it
+
+            friend row operator+(row r, row_shift d)
+            {
+                r.start += d.bytes;
+                r.end += d.bytes;
+                r.line += d.lines;
+                return r;
+            }
         };
 
         struct edit
@@ -120,8 +159,8 @@ namespace simple_notepad
             double time;
         };
 
-        std::string text_;
-        std::vector<fade> fades_; // recently inserted byte ranges that are still fading in
+        mutable gap_buffer<std::string> text_; // mutable: making a range one run moves the gap, not the text
+        std::vector<fade> fades_;              // recently inserted byte ranges that are still fading in
         std::string needle_;
         bool needle_case_ = false;
         bool matches_dirty_ = false;
@@ -129,13 +168,17 @@ namespace simple_notepad
         bool matches_capped_ = false;
         std::vector<std::pair<int, int>> matches_; // sorted, non-overlapping byte ranges of needle_
         const syntax::language* language_ = nullptr;
-        std::vector<syntax::span> spans_;
+        syntax::span_buffer spans_;
         bool spans_dirty_ = false;                                     // needs a full scan
         syntax::edit edited_{.start = -1, .old_end = 0, .new_end = 0}; // range changed since the last scan
         int scanned_size_ = 0;
-        std::vector<row> rows_{{.start = 0, .end = 0, .line = 0, .first = true, .width = 0.0f}};
+        gap_buffer<std::vector<row>, row_shift> rows_{
+            std::vector<row>{{.start = 0, .end = 0, .line = 0, .first = true, .width = 0.0f}}};
         int line_count_ = 1;
         int char_count_ = 0;
+        // characters from the line start to column_pos_, carried along so a huge line is counted once
+        mutable int column_pos_ = -1;
+        mutable int column_chars_ = 0;
 
         // layout cache, rebuilt when text, font size or wrap width change
         bool layout_dirty_ = true;
@@ -145,6 +188,7 @@ namespace simple_notepad
         ImFontBaked* baked_ = nullptr;
         std::array<float, 128> ascii_advance_{};
         float tab_width_ = 0.0f;
+        float mono_advance_ = 0.0f; // every printable ascii character's advance when they share one, else 0
         float line_height_ = 0.0f;
 
         int caret_ = 0;
@@ -163,6 +207,22 @@ namespace simple_notepad
         bool dragging_ = false;
         bool panning_ = false;
         float teardrop_ = 0.0f; // minimap off-frame marker, 0 hidden to 1 shown
+        struct minimap_block
+        {
+            float x0, y0, x1, y1;
+            std::uint32_t col;
+        };
+        struct minimap_key // everything the blocks are drawn from
+        {
+            std::uint64_t revision;
+            int first, last;
+            float offset, left, top, scale, max_x, block_h;
+            std::uint32_t ink;
+            bool operator==(const minimap_key&) const = default;
+        };
+        std::vector<minimap_block> minimap_blocks_;
+        minimap_key minimap_key_{};
+        std::uint64_t revision_ = 0; // changes with the text, rows or spans
         static constexpr float MINIMAP_WIDTH = 110.0f;
         float minimap_width_ = MINIMAP_WIDTH; // unscaled, dragged by its left edge
         bool snap_caret_ = true;
@@ -186,11 +246,13 @@ namespace simple_notepad
 
         [[nodiscard]] float advance(unsigned int c, float x) const;
         [[nodiscard]] float measure(int start, int end) const;
-        void layout_line(int line_start, int line, std::vector<row>& out) const;
+        [[nodiscard]] row next_row(int start, int line, bool first, int max_end) const;
+        [[nodiscard]] row row_after(const row& r, int max_end) const; // r must not end the text
         void rebuild_layout(float wrap_width);
         void replace_text(int pos, int remove, std::string_view insert);
         void update_content_width();
         void find_matches();
+        void update_matches(int pos, int remove, int inserted);
         [[nodiscard]] bool same_char(char a, char b) const; // honours needle_case_
         [[nodiscard]] int row_of(int pos) const;
         [[nodiscard]] float x_of(int pos) const;
@@ -202,8 +264,10 @@ namespace simple_notepad
         [[nodiscard]] int word_edge(int pos, bool forward) const;
         [[nodiscard]] std::pair<int, int> word_at(int pos) const;
         [[nodiscard]] std::pair<int, int> line_at(int pos) const;
+        [[nodiscard]] int line_start(int pos) const;
+        [[nodiscard]] int line_end(int pos) const; // excludes the newline
 
-        void apply(int pos, int remove, std::string_view insert, merge kind);
+        void apply(int pos, int remove, std::string insert, merge kind);
         void undo();
         void redo();
         void move_caret(int pos, bool extend);

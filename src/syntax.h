@@ -1,9 +1,11 @@
 #pragma once
 
+#include "gap_buffer.h"
 #include <array>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -30,7 +32,13 @@ namespace simple_notepad
             int start;
             int end;
             token kind;
+
+            friend span operator+(span s, int delta)
+            {
+                return {.start = s.start + delta, .end = s.end + delta, .kind = s.kind};
+            }
         };
+        using span_buffer = gap_buffer<std::vector<span>, int>;
 
         struct block
         {
@@ -53,21 +61,28 @@ namespace simple_notepad
         struct edit
         {
             int start;
-            int old_end; // end of the replaced bytes before the edit
-            int new_end; // end of the inserted bytes
+            int old_end;         // end of the replaced bytes before the edit
+            int new_end;         // end of the inserted bytes
+            bool joined = false; // a line break was removed
         };
+
+        // bytes highlighted per line, so an edit in a huge line rescans a bounded stretch (vs code stops at 20k)
+        static constexpr size_t LINE_CAP = 64 * 1024;
 
         [[nodiscard]] static const language* find(const std::filesystem::path& filename); // nullptr for plain text
         [[nodiscard]] static std::vector<span> scan(const language& lang, std::string_view text); // sorted, disjoint
         // updates spans of the text before e: rescans from the edited line until the old spans line up again
-        static void rescan(const language& lang, std::string_view text, edit e, std::vector<span>& spans);
+        static void rescan(const language& lang, gap_buffer<std::string>& text, edit e, span_buffer& spans);
 
       private:
         struct job
         {
             std::string_view text;
             size_t from = 0;
-            std::function<bool(size_t)> stop; // asked where the scan holds no state: line starts, span ends
+            size_t cap = LINE_CAP; // where the line at from stops being highlighted
+            // asked where the scan holds no state: line starts and span ends, with that line's cap
+            std::function<bool(size_t, size_t)> stop;
+            std::function<bool(size_t, size_t)> capped; // asked when the scan reaches a line's cap
             std::vector<span> out;
         };
 
