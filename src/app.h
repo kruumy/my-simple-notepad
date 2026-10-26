@@ -119,6 +119,8 @@ namespace simple_notepad
         void find_next(bool backward);
         void replace_next();
         void replace_all();
+        void format_json();
+        [[nodiscard]] static std::string pretty_json(std::string_view text);
         void set_zoom(float zoom);
         void show_toast(std::string text);
         void update_title();

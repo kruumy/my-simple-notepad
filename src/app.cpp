@@ -704,6 +704,14 @@ namespace simple_notepad
                 }
                 ImGui::EndMenu();
             }
+            if (ImGui::BeginMenu("Tools"))
+            {
+                if (ImGui::MenuItem("Format JSON"))
+                {
+                    format_json();
+                }
+                ImGui::EndMenu();
+            }
             draw_caption();
             ImGui::EndMenuBar();
         }
@@ -1345,6 +1353,99 @@ namespace simple_notepad
         result.append(text, from);
         editor_.replace_all(result);
         show_toast(std::format("Replaced {} occurrence{} (Ctrl+Z to undo)", replaced, replaced == 1 ? "" : "s"));
+    }
+
+    void app::format_json()
+    {
+        std::string result = pretty_json(editor_.text());
+        if (result.empty())
+        {
+            show_toast("Not valid JSON: brackets or quotes don't balance");
+            return;
+        }
+        editor_.replace_all(result);
+        show_toast("Formatted JSON (Ctrl+Z to undo)");
+    }
+
+    // re-indents by bracket depth without parsing values; empty on unbalanced brackets or an open string
+    std::string app::pretty_json(std::string_view text)
+    {
+        std::string out;
+        out.reserve(text.size() * 2);
+        int depth = 0;
+        bool in_string = false;
+        const auto newline = [&] {
+            out += '\n';
+            out.append(static_cast<size_t>(depth) * 4, ' ');
+        };
+        // raw loop: each character's output depends on the state the previous ones left
+        for (size_t i = 0; i < text.size(); ++i)
+        {
+            const char c = text[i];
+            if (in_string)
+            {
+                out += c;
+                if (c == '\\' && i + 1 < text.size())
+                {
+                    out += text[++i];
+                }
+                else if (c == '"')
+                {
+                    in_string = false;
+                }
+                continue;
+            }
+            switch (c)
+            {
+            case ' ':
+            case '\t':
+            case '\r':
+            case '\n':
+                break;
+            case '"':
+                in_string = true;
+                out += c;
+                break;
+            case '{':
+            case '[': {
+                out += c;
+                ++depth;
+                const size_t next = text.find_first_not_of(" \t\r\n", i + 1);
+                if (next != std::string_view::npos && (text[next] == '}' || text[next] == ']'))
+                {
+                    break; // keeps {} and [] on one line
+                }
+                newline();
+                break;
+            }
+            case '}':
+            case ']':
+                if (--depth < 0)
+                {
+                    return {};
+                }
+                if (out.back() != '{' && out.back() != '[')
+                {
+                    newline();
+                }
+                out += c;
+                break;
+            case ',':
+                out += c;
+                newline();
+                break;
+            case ':':
+                out += ": ";
+                break;
+            default:
+                out += c;
+            }
+        }
+        if (depth != 0 || in_string)
+        {
+            return {};
+        }
+        return out;
     }
 
     void app::set_zoom(float zoom)
