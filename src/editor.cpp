@@ -775,7 +775,7 @@ namespace simple_notepad
             const bool recent = last.kind == kind && now - last.time < MERGE_SECONDS;
             // typing groups per word; deleting groups runs of backspace or delete
             if (recent && kind == merge::typing && remove == 0 &&
-                last.pos + static_cast<int>(last.inserted.size()) == pos &&
+                last.pos + static_cast<int>(last.inserted.size()) == pos && !last.inserted.empty() &&
                 (last.inserted.back() != ' ' || insert == " "))
             {
                 last.inserted += insert;
