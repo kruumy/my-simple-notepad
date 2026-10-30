@@ -614,6 +614,8 @@ namespace simple_notepad
         context_->ClearRenderTargetView(target_.Get(), &CLEAR_COLOR.x);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
         swap_chain_->Present(1, 0);
+        // caps the frame rate when the driver forces vsync off and ignores the sync interval
+        DwmFlush();
 
         update_title();
         in_frame_ = false;
