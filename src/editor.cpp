@@ -26,7 +26,17 @@ namespace simple_notepad
     constexpr float MINIMAP_ROW = 2.0f;
     constexpr float MINIMAP_CHAR = 1.1f;
     constexpr float SCROLL_SPEED = 22.0f;
-    constexpr float CARET_SPEED = 38.0f;
+    // neovide-style caret: each corner springs separately, leading corners snap and trailing ones lag by rank
+    constexpr float CARET_SECONDS = 0.125f;
+    constexpr float CARET_SHORT_SECONDS = 0.05f; // typing and short hops along a row
+    constexpr float CARET_SHORT_CHARS = 8.0f;
+    constexpr float CARET_SNAP_SECONDS = 0.02f;
+    constexpr float CARET_LEADING = 0.5f; // alignment with the move that makes a corner lead
+    constexpr std::array<float, 4> CARET_TRAIL = {1.0f, 0.9f, 0.5f, 0.3f}; // by rank, most trailing first
+    // each corner's place in the caret box, -0.5 to 0.5, clockwise from top left
+    constexpr std::array<std::pair<float, float>, 4> CARET_CORNERS = {
+        {{-0.5f, -0.5f}, {0.5f, -0.5f}, {0.5f, 0.5f}, {-0.5f, 0.5f}}};
+    constexpr float CARET_RESET_SECONDS = 0.075f; // slower springs drop their old momentum on a new move
     constexpr float TEARDROP_SPEED = 14.0f;
     constexpr double BLINK_HALF_PERIOD = 0.5;
     constexpr double MERGE_SECONDS = 1.0;
@@ -40,6 +50,17 @@ namespace simple_notepad
     constexpr size_t MAX_REFLOW_ROWS = 64;                    // rows an edit rewraps before it settles for a short one
     constexpr ImU32 MATCH_COLOR = IM_COL32(234, 92, 0, 85);   // vs code's find highlight
     constexpr ImU32 MATCH_MARK_COLOR = IM_COL32(209, 134, 22, 255);
+    constexpr float SELECT_SPEED = 30.0f;
+    constexpr double FLASH_SECONDS = 0.6;
+    constexpr int FLASH_ALPHA = 60;
+    constexpr ImU32 WORD_COLOR = IM_COL32(255, 255, 255, 22);
+    constexpr ImU32 WORD_MARK_COLOR = IM_COL32(200, 200, 200, 170);
+    constexpr int MAX_WORD_BYTES = 200;
+    constexpr size_t MAX_WORD_SCAN_BYTES =
+        size_t{16} * 1024 * 1024;                 // past this every selection change would stall on a scan
+    constexpr int MAX_BRACKET_SCAN = 1024 * 1024; // bytes searched for a partner before giving up
+    constexpr double BRACKET_PULSE_SECONDS = 0.45;
+    constexpr ImU32 BRACKET_COLOR = IM_COL32(255, 255, 255, 70);
     constexpr int MAX_HIGHLIGHT_BYTES = 200 * 1024 * 1024; // notepad++'s default large file restriction
     // vs code dark modern, indexed by syntax::token
     constexpr std::array<ImU32, 8> TOKEN_COLORS = {
@@ -84,8 +105,11 @@ namespace simple_notepad
         edited_ = {.start = -1, .old_end = 0, .new_end = 0};
         scanned_size_ = static_cast<int>(text_.size());
         ++revision_;
+        ++content_revision_;
         column_pos_ = -1;
         fades_.clear();
+        flashes_.clear();
+        last_selection_ = {0, 0};
         matches_dirty_ = true;
         undo_.clear();
         redo_.clear();
@@ -113,7 +137,12 @@ namespace simple_notepad
     void editor::insert(std::string_view text)
     {
         const auto [lo, hi] = selection();
+        const std::uint64_t before = state();
         apply(lo, hi - lo, std::string(text), merge::none);
+        if (state() != before) // apply refuses edits when read-only or too large
+        {
+            flash(lo, lo + static_cast<int>(text.size()));
+        }
     }
 
     void editor::select(int start, int end)
@@ -238,8 +267,9 @@ namespace simple_notepad
 
     bool editor::animating() const
     {
-        return !caret_settled_ || !fades_.empty() || scroll_x_ != target_x_ || scroll_y_ != target_y_ ||
-               (teardrop_ != 0.0f && teardrop_ != 1.0f);
+        return !caret_settled_ || !select_settled_ || !fades_.empty() || !flashes_.empty() ||
+               ImGui::GetTime() - bracket_time_ < BRACKET_PULSE_SECONDS || scroll_x_ != target_x_ ||
+               scroll_y_ != target_y_ || (teardrop_ != 0.0f && teardrop_ != 1.0f);
     }
 
     double editor::seconds_until_blink() const
@@ -397,6 +427,7 @@ namespace simple_notepad
     void editor::replace_text(int pos, int remove, std::string_view insert)
     {
         ++revision_;
+        ++content_revision_;
         const int delta = static_cast<int>(insert.size()) - remove;
         const int new_size = static_cast<int>(text_.size()) + delta;
         if (std::max(static_cast<int>(text_.size()), new_size) > MAX_HIGHLIGHT_BYTES)
@@ -413,14 +444,8 @@ namespace simple_notepad
                               : edited_.new_end + inserted_end - (pos + remove);
         edited_.start = edited_.start < 0 ? pos : std::min(edited_.start, pos);
         edited_.old_end = edited_.new_end - (new_size - scanned_size_);
-        std::erase_if(fades_, [&](const fade& f) { return f.end > pos && f.start < pos + remove; });
-        std::ranges::for_each(fades_, [&](fade& f) {
-            if (f.start >= pos)
-            {
-                f.start += delta;
-                f.end += delta;
-            }
-        });
+        shift_ranges(fades_, pos, remove, delta);
+        shift_ranges(flashes_, pos, remove, delta);
         const std::string_view removed = text_.view(pos, pos + remove);
         edited_.joined = edited_.joined || removed.find('\n') != std::string_view::npos;
         char_count_ += utf8_length(insert) - utf8_length(removed);
@@ -819,6 +844,7 @@ namespace simple_notepad
         edit e = std::move(undo_.back());
         undo_.pop_back();
         replace_text(e.pos, static_cast<int>(e.inserted.size()), e.removed);
+        flash(e.pos, e.pos + static_cast<int>(e.removed.size()));
         move_caret(e.caret_before, false);
         anchor_ = e.anchor_before;
         redo_.push_back(std::move(e));
@@ -833,6 +859,7 @@ namespace simple_notepad
         edit e = std::move(redo_.back());
         redo_.pop_back();
         replace_text(e.pos, static_cast<int>(e.removed.size()), e.inserted);
+        flash(e.pos, e.pos + static_cast<int>(e.inserted.size()));
         move_caret(e.pos + static_cast<int>(e.inserted.size()), false);
         e.kind = merge::none; // never merge new typing into a redone step
         undo_.push_back(std::move(e));
@@ -999,7 +1026,7 @@ namespace simple_notepad
             {
                 std::string pasted = clip;
                 std::erase(pasted, '\r');
-                apply(lo, hi - lo, std::move(pasted), merge::none);
+                insert(pasted);
             }
         }
         else if (ctrl && (pressed(ImGuiKey_Y) || (shift && pressed(ImGuiKey_Z))))
@@ -1330,6 +1357,7 @@ namespace simple_notepad
         if (spans_dirty_)
         {
             ++revision_;
+            ++content_revision_;
             spans_ = syntax::span_buffer(scan(language_, text_.view(0, text_.size())));
         }
         else if (highlight && edited_.start >= 0)
@@ -1399,6 +1427,158 @@ namespace simple_notepad
         return at + ((p - at) / zoom_scale_);
     }
 
+    // ranges an edit overlaps are dropped; ones after it move with the text
+    void editor::shift_ranges(std::vector<fade>& ranges, int pos, int remove, int delta)
+    {
+        std::erase_if(ranges, [&](const fade& f) { return f.end > pos && f.start < pos + remove; });
+        std::ranges::for_each(ranges, [&](fade& f) {
+            if (f.start >= pos)
+            {
+                f.start += delta;
+                f.end += delta;
+            }
+        });
+    }
+
+    // empty ranges draw nothing but would keep frames coming
+    void editor::flash(int start, int end)
+    {
+        if (end > start)
+        {
+            flashes_.push_back({.start = start, .end = end, .time = ImGui::GetTime()});
+        }
+    }
+
+    // whole-word occurrences of the selection when it is exactly one word
+    void editor::find_word_matches(int lo, int hi)
+    {
+        word_matches_.clear();
+        if (lo == hi || hi - lo > MAX_WORD_BYTES || text_.size() > MAX_WORD_SCAN_BYTES || char_class(text_[lo]) != 1 ||
+            word_at(lo) != std::pair{lo, hi})
+        {
+            return;
+        }
+        const size_t size = text_.size();
+        const auto n = static_cast<size_t>(hi - lo);
+        const std::string word(text_.view(lo, hi)); // a copy: the views below move the gap
+        const auto is_word = [&](size_t i) { return i < size && char_class(text_[i]) == 1; };
+        const auto find_in = [&](size_t a, size_t b) {
+            const std::string_view range = text_.view(a, b);
+            // raw loop: each find starts past the last hit
+            for (size_t at = range.find(word); at != std::string_view::npos && word_matches_.size() < MAX_MATCHES;
+                 at = range.find(word, at + 1))
+            {
+                if ((a + at == 0 || !is_word(a + at - 1)) && !is_word(a + at + n))
+                {
+                    word_matches_.emplace_back(static_cast<int>(a + at), static_cast<int>(a + at + n));
+                }
+            }
+        };
+        // either side of the edit gap, then the hits straddling it, so the gap moves a word's length, not the file
+        const size_t split = text_runs()[0].size();
+        find_in(0, split);
+        find_in(split + 1 > n ? split + 1 - n : 0, std::min(size, split + n - 1));
+        find_in(split, size);
+    }
+
+    bool editor::in_literal(int pos) const
+    {
+        const size_t i = spans_.partition_point([&](const syntax::span& sp) { return sp.end <= pos; });
+        return i < spans_.size() && spans_[i].start <= pos &&
+               (spans_[i].kind == syntax::token::comment || spans_[i].kind == syntax::token::string);
+    }
+
+    // the bracket right of pos, else left of it, and its partner; brackets in comments and strings don't count
+    std::pair<int, int> editor::match_bracket(int pos) const
+    {
+        static constexpr std::string_view OPEN = "([{";
+        static constexpr std::string_view CLOSE = ")]}";
+        const int size = static_cast<int>(text_.size());
+        for (const int at : {pos, pos - 1})
+        {
+            if (at < 0 || at >= size || in_literal(at))
+            {
+                continue;
+            }
+            const char c = text_[at];
+            const size_t open = OPEN.find(c);
+            const size_t close = CLOSE.find(c);
+            if (open == std::string_view::npos && close == std::string_view::npos)
+            {
+                continue;
+            }
+            const bool forward = open != std::string_view::npos;
+            const char partner = forward ? CLOSE[open] : OPEN[close];
+            const int step = forward ? 1 : -1;
+            int depth = 0;
+            // raw loop: walks byte by byte from the bracket, counting nesting
+            for (int p = at + step, n = 0; p >= 0 && p < size && n < MAX_BRACKET_SCAN; p += step, ++n)
+            {
+                const char d = text_[p];
+                if ((d != c && d != partner) || in_literal(p))
+                {
+                    continue;
+                }
+                if (d == c)
+                {
+                    ++depth;
+                }
+                else if (depth-- == 0)
+                {
+                    return {at, p};
+                }
+            }
+        }
+        return {-1, -1};
+    }
+
+    // the target moved by dx, dy: corners keep their drawn spots and pick springs by how they face the move
+    void editor::retarget_caret(float dx, float dy)
+    {
+        const bool short_move = dy == 0.0f && std::abs(dx) <= CARET_SHORT_CHARS * advance(' ', 0.0f);
+        const float base = short_move ? CARET_SHORT_SECONDS : CARET_SECONDS;
+        std::array<float, 4> alignment{};
+        // raw loop: corners, their places and alignments share an index
+        for (size_t i = 0; i < caret_corners_.size(); ++i)
+        {
+            caret_corner& c = caret_corners_[i];
+            const auto [rel_x, rel_y] = CARET_CORNERS[i];
+            c.off_x += dx;
+            c.off_y += dy;
+            const float travel = std::hypot(c.off_x, c.off_y) * std::hypot(rel_x, rel_y);
+            alignment[i] = travel > 0.0f ? ((c.off_x * rel_x) + (c.off_y * rel_y)) / travel : 0.0f;
+        }
+        std::array<size_t, 4> by_rank{0, 1, 2, 3};
+        std::ranges::sort(by_rank, {}, [&](size_t i) { return alignment[i]; });
+        // raw loop: the rank is the index into CARET_TRAIL
+        for (size_t rank = 0; rank < by_rank.size(); ++rank)
+        {
+            caret_corner& c = caret_corners_[by_rank[rank]];
+            c.seconds = alignment[by_rank[rank]] > CARET_LEADING ? CARET_SNAP_SECONDS : base * CARET_TRAIL[rank];
+            if (c.seconds > CARET_RESET_SECONDS)
+            {
+                c.vel_x = c.vel_y = 0.0f;
+            }
+        }
+    }
+
+    // critically damped spring toward zero offset; false once it has landed
+    bool editor::spring(float& offset, float& velocity, float seconds, float dt)
+    {
+        if (seconds <= dt || std::abs(offset) < PIXEL_SNAP)
+        {
+            offset = velocity = 0.0f;
+            return false;
+        }
+        const float omega = 4.0f / seconds;
+        const float a = offset;
+        const float b = (offset * omega) + velocity;
+        const float decay = std::exp(-omega * dt);
+        offset = (a + (b * dt)) * decay;
+        velocity = decay * (b - (a * omega) - (b * dt * omega));
+        return true;
+    }
+
     void editor::draw_text(float origin_x, float origin_y)
     {
         ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -1412,10 +1592,57 @@ namespace simple_notepad
         const int caret_row = row_of(caret_);
         const float text_offset = (lh - ImGui::GetFontSize()) * 0.5f;
         const ImU32 text_col = ImGui::GetColorU32(ImGuiCol_Text);
-        const ImU32 select_col = ImGui::GetColorU32(ImGuiCol_TextSelectedBg);
         const char* s = nullptr; // the row being drawn, made whole one row at a time so the gap moves at most a row
         const double now = ImGui::GetTime();
         std::erase_if(fades_, [&](const fade& f) { return now - f.time >= FADE_SECONDS; });
+        std::erase_if(flashes_, [&](const fade& f) { return now - f.time >= FLASH_SECONDS; });
+
+        // selection: its ends glide like the caret
+        const auto end_at = [&](int pos) { return std::pair{x_of(pos), static_cast<float>(row_of(pos)) * lh}; };
+        select_settled_ = true;
+        if (lo != hi)
+        {
+            const auto [lo_x, lo_y] = end_at(lo);
+            const auto [hi_x, hi_y] = end_at(hi);
+            const std::array<float, 4> target{lo_x, lo_y, hi_x, hi_y};
+            if (snap_caret_)
+            {
+                select_ends_ = target;
+            }
+            else if (last_selection_.first == last_selection_.second || hi < last_selection_.first ||
+                     lo > last_selection_.second)
+            {
+                // new, or jumped away (find next): grows from its anchor rather than sweeping across the rows between
+                const auto [x, y] = end_at(anchor_);
+                select_ends_ = {x, y, x, y};
+            }
+            // raw loop: ends and targets share an index
+            for (size_t i = 0; i < select_ends_.size(); ++i)
+            {
+                select_ends_[i] = motion::approach(select_ends_[i], target[i], SELECT_SPEED, PIXEL_SNAP);
+                select_settled_ = select_settled_ && select_ends_[i] == target[i];
+            }
+        }
+        last_selection_ = {lo, hi};
+        const ImU32 select_col = ImGui::GetColorU32(ImGuiCol_TextSelectedBg);
+        const int select_lo_row = static_cast<int>(std::lround(select_ends_[1] / lh));
+        const int select_hi_row = static_cast<int>(std::lround(select_ends_[3] / lh));
+
+        if (word_key_ != std::tuple{lo, hi, content_revision_})
+        {
+            word_key_ = {lo, hi, content_revision_};
+            find_word_matches(lo, hi);
+        }
+        if (bracket_key_ != std::pair{caret_, content_revision_})
+        {
+            bracket_key_ = {caret_, content_revision_};
+            const std::pair<int, int> found = lo == hi ? match_bracket(caret_) : std::pair{-1, -1};
+            if (found != brackets_ && found.first >= 0)
+            {
+                bracket_time_ = now;
+            }
+            brackets_ = found;
+        }
 
         // draws [p, q) from x, returning the end x; split at syntax colour changes and fading new characters
         const auto draw_run = [&](int p, int q, float x, float y) {
@@ -1470,38 +1697,76 @@ namespace simple_notepad
             dl->AddRectFilled({inner.Min.x, y}, {inner.Max.x, y + lh}, IM_COL32(255, 255, 255, 9));
         }
 
-        auto match = show_matches_
-                         ? std::ranges::upper_bound(matches_, rows_[first].start, {}, &std::pair<int, int>::second)
-                         : matches_.end();
+        // x span of [a, b) on row w, reaching past the row end when it takes the newline too
+        const auto span_x = [&](const row& w, int a, int b) {
+            float x1 = measure(w.start, std::min(b, w.end));
+            if (b > w.end && std::cmp_less(w.end, text_.size()) && text_[w.end] == '\n')
+            {
+                x1 += ascii_advance_[' '] * 0.6f;
+            }
+            return std::pair{origin_x + measure(w.start, std::max(a, w.start)), origin_x + x1};
+        };
+        // raw loop: walks sorted ranges alongside the rows; one wrapped across rows shows on each
+        const auto draw_ranges = [&](const std::vector<std::pair<int, int>>& ranges, auto& it, const row& w, float y,
+                                     ImU32 col) {
+            for (; it != ranges.end() && it->first < w.end; ++it)
+            {
+                const auto [x0, x1] = span_x(w, it->first, std::min(it->second, w.end));
+                dl->AddRectFilled({x0, y}, {x1, y + lh}, col, 3.0f * dpi_);
+                if (it->second > w.end)
+                {
+                    break; // continues on the next row
+                }
+            }
+        };
+        const auto first_range = [&](const std::vector<std::pair<int, int>>& ranges, bool shown) {
+            return shown ? std::ranges::upper_bound(ranges, rows_[first].start, {}, &std::pair<int, int>::second)
+                         : ranges.end();
+        };
+        auto match = first_range(matches_, show_matches_);
+        auto word = first_range(word_matches_, focused_);
         for (int r = first; r <= last; ++r) // raw loop: visible rows by index
         {
             const row w = rows_[r];
             s = text_.contiguous(w.start, w.end);
             const float y = origin_y + (static_cast<float>(r) * lh);
-            // raw loop: walks the sorted matches alongside the rows; one wrapped across rows shows on each
-            for (; match != matches_.end() && match->first < w.end; ++match)
+            draw_ranges(matches_, match, w, y, MATCH_COLOR);
+            draw_ranges(word_matches_, word, w, y, WORD_COLOR);
+            for (const fade& f : flashes_)
             {
-                const float x0 = origin_x + measure(w.start, std::max(match->first, w.start));
-                const float x1 = origin_x + measure(w.start, std::min(match->second, w.end));
-                dl->AddRectFilled({x0, y}, {x1, y + lh}, MATCH_COLOR, 3.0f * dpi_);
-                if (match->second > w.end)
+                if (f.end > f.start && f.start <= w.end && f.end > w.start)
                 {
-                    break; // continues on the next row
+                    // linear, so it lingers long enough to notice
+                    const auto t = static_cast<float>((now - f.time) / FLASH_SECONDS);
+                    const auto [x0, x1] = span_x(w, f.start, f.end);
+                    dl->AddRectFilled({x0, y}, {x1, y + lh},
+                                      IM_COL32(255, 255, 255, static_cast<int>(FLASH_ALPHA * (1.0f - t))), 3.0f * dpi_);
                 }
             }
-            if (lo != hi && lo <= w.end && hi >= w.start)
+            // the band between the gliding ends' rows; partly covered rows show it sliding in
+            const float row_top = static_cast<float>(r) * lh;
+            const float top = std::max(row_top, select_ends_[1]);
+            const float bottom = std::min(row_top + lh, select_ends_[3] + lh);
+            if (lo != hi && bottom > top)
             {
-                const int a = std::max(lo, w.start);
-                const int b = std::min(hi, w.end);
-                const float x0 = origin_x + measure(w.start, a);
-                float x1 = origin_x + measure(w.start, b);
-                if (hi > w.end && std::cmp_less(w.end, text_.size()) && text_[w.end] == '\n')
-                {
-                    x1 += ascii_advance_[' '] * 0.6f; // show that the newline is selected
-                }
+                const float x0 = r <= select_lo_row ? origin_x + select_ends_[0] : origin_x;
+                const float x1 = r >= select_hi_row ? origin_x + select_ends_[2] : span_x(w, w.end, w.end + 1).second;
                 if (x1 > x0)
                 {
-                    dl->AddRectFilled({x0, y}, {x1, y + lh}, select_col, 3.0f * dpi_);
+                    dl->AddRectFilled({x0, origin_y + top}, {x1, origin_y + bottom}, select_col, 3.0f * dpi_);
+                }
+            }
+            for (const int p : {brackets_.first, brackets_.second})
+            {
+                if (focused_ && p >= w.start && p < w.end)
+                {
+                    const float x0 = origin_x + measure(w.start, p);
+                    const float x1 = x0 + ascii_advance_[static_cast<unsigned char>(text_[p])];
+                    const float pulse =
+                        1.0f - motion::ease_out(static_cast<float>((now - bracket_time_) / BRACKET_PULSE_SECONDS));
+                    dl->AddRectFilled({x0, y}, {x1, y + lh}, IM_COL32(255, 255, 255, static_cast<int>(60 * pulse)),
+                                      2.0f * dpi_);
+                    dl->AddRect({x0, y}, {x1, y + lh}, BRACKET_COLOR, 2.0f * dpi_, 0, 1.0f * dpi_);
                 }
             }
             float x = 0.0f;
@@ -1540,18 +1805,32 @@ namespace simple_notepad
             }
         }
 
-        // smooth caret: glides toward its target, then blinks once settled
+        // smooth caret: its corners spring toward the target, then it blinks once settled
         const float target_x = x_of(caret_);
         const float target_y = static_cast<float>(caret_row) * lh;
         if (snap_caret_)
         {
-            caret_x_ = target_x;
-            caret_y_ = target_y;
+            for (caret_corner& c : caret_corners_)
+            {
+                c.off_x = c.off_y = c.vel_x = c.vel_y = 0.0f;
+            }
             snap_caret_ = false;
         }
-        caret_x_ = motion::approach(caret_x_, target_x, CARET_SPEED, PIXEL_SNAP);
-        caret_y_ = motion::approach(caret_y_, target_y, CARET_SPEED, PIXEL_SNAP);
-        caret_settled_ = caret_x_ == target_x && caret_y_ == target_y;
+        else if (target_x != caret_x_ || target_y != caret_y_)
+        {
+            retarget_caret(target_x - caret_x_, target_y - caret_y_);
+        }
+        caret_x_ = target_x;
+        caret_y_ = target_y;
+        const float dt = std::min(ImGui::GetIO().DeltaTime, 1.0f / 30.0f);
+        caret_settled_ = true;
+        for (caret_corner& c : caret_corners_)
+        {
+            // both axes step even when one settles first
+            const bool moving_x = spring(c.off_x, c.vel_x, c.seconds, dt);
+            const bool moving_y = spring(c.off_y, c.vel_y, c.seconds, dt);
+            caret_settled_ = caret_settled_ && !moving_x && !moving_y;
+        }
         if (!focused_)
         {
             return;
@@ -1559,11 +1838,22 @@ namespace simple_notepad
         const bool visible =
             !caret_settled_ || std::fmod(ImGui::GetTime() - caret_moved_, BLINK_HALF_PERIOD * 2) < BLINK_HALF_PERIOD;
         const ImVec2 caret{origin_x + caret_x_, origin_y + caret_y_};
-        if (visible)
+        const ImVec2 box_min{caret.x - (1.0f * dpi_), caret.y + (2.0f * dpi_)};
+        const ImVec2 box_max{caret.x + (1.0f * dpi_), caret.y + lh - (2.0f * dpi_)};
+        const ImU32 caret_color = ImGui::GetColorU32(ImGuiCol_InputTextCursor);
+        if (visible && caret_settled_)
         {
-            dl->AddRectFilled({caret.x - (1.0f * dpi_), caret.y + (2.0f * dpi_)},
-                              {caret.x + (1.0f * dpi_), caret.y + lh - (2.0f * dpi_)},
-                              ImGui::GetColorU32(ImGuiCol_InputTextCursor), 1.0f * dpi_);
+            dl->AddRectFilled(box_min, box_max, caret_color, 1.0f * dpi_);
+        }
+        else if (visible)
+        {
+            std::array<ImVec2, 4> quad;
+            std::ranges::transform(
+                caret_corners_, CARET_CORNERS, quad.begin(), [&](const caret_corner& c, std::pair<float, float> rel) {
+                    return ImVec2{((box_min.x + box_max.x) * 0.5f) + (rel.first * (box_max.x - box_min.x)) - c.off_x,
+                                  ((box_min.y + box_max.y) * 0.5f) + (rel.second * (box_max.y - box_min.y)) - c.off_y};
+                });
+            dl->AddQuadFilled(quad[0], quad[1], quad[2], quad[3], caret_color);
         }
         ImGuiPlatformImeData& ime = GImGui->PlatformImeData;
         ime.WantVisible = ime.WantTextInput = true;
@@ -1764,25 +2054,29 @@ namespace simple_notepad
         }
         std::ranges::for_each(minimap_blocks_,
                               [&](const minimap_block& b) { dl->AddRectFilled({b.x0, b.y0}, {b.x1, b.y1}, b.col); });
-        auto match = show_matches_
-                         ? std::ranges::upper_bound(matches_, rows_[first].start, {}, &std::pair<int, int>::second)
-                         : matches_.end();
-        for (int r = first; r <= last && match != matches_.end(); ++r) // raw loop: visible rows by index
-        {
-            const row w = rows_[r];
-            const float y = std::round(top_ + (static_cast<float>(r) * row_h) - offset);
-            // raw loop: as in draw_text; at least 2 px wide so a short match still shows
-            for (; match != matches_.end() && match->first < w.end; ++match)
+        const auto draw_marks = [&](const std::vector<std::pair<int, int>>& ranges, bool shown, ImU32 col) {
+            auto match = shown ? std::ranges::upper_bound(ranges, rows_[first].start, {}, &std::pair<int, int>::second)
+                               : ranges.end();
+            for (int r = first; r <= last && match != ranges.end(); ++r) // raw loop: visible rows by index
             {
-                const float x0 = left + (std::min(measure(w.start, std::max(match->first, w.start)), max_x) * scale);
-                const float x1 = left + (std::min(measure(w.start, std::min(match->second, w.end)), max_x) * scale);
-                dl->AddRectFilled({x0, y}, {std::max(x1, x0 + (2.0f * dpi_)), y + row_h}, MATCH_MARK_COLOR);
-                if (match->second > w.end)
+                const row w = rows_[r];
+                const float y = std::round(top_ + (static_cast<float>(r) * row_h) - offset);
+                // raw loop: as in draw_text; at least 2 px wide so a short match still shows
+                for (; match != ranges.end() && match->first < w.end; ++match)
                 {
-                    break;
+                    const float x0 =
+                        left + (std::min(measure(w.start, std::max(match->first, w.start)), max_x) * scale);
+                    const float x1 = left + (std::min(measure(w.start, std::min(match->second, w.end)), max_x) * scale);
+                    dl->AddRectFilled({x0, y}, {std::max(x1, x0 + (2.0f * dpi_)), y + row_h}, col);
+                    if (match->second > w.end)
+                    {
+                        break;
+                    }
                 }
             }
-        }
+        };
+        draw_marks(word_matches_, focused_, WORD_MARK_COLOR);
+        draw_marks(matches_, show_matches_, MATCH_MARK_COLOR);
         // spans the full width unless the text is wider than the view
         const float pad = PAD * dpi_;
         float view_left = x + 1.0f;

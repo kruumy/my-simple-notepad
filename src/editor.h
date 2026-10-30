@@ -8,6 +8,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -167,7 +168,18 @@ namespace simple_notepad
 
         mutable gap_buffer<std::string> text_; // mutable: making a range one run moves the gap, not the text
         bool read_only_ = false;
-        std::vector<fade> fades_; // recently inserted byte ranges that are still fading in
+        std::vector<fade> fades_;   // recently inserted byte ranges that are still fading in
+        std::vector<fade> flashes_; // pasted, undone or redone ranges that light up briefly
+        // the selection is drawn from these gliding ends, content space: low x, low row top, high x, high row top
+        std::array<float, 4> select_ends_{};
+        // drawn last frame, empty for none; a new selection not touching it grows from its anchor instead of gliding
+        std::pair<int, int> last_selection_{0, 0};
+        bool select_settled_ = true;
+        std::vector<std::pair<int, int>> word_matches_;           // other places the selected word appears
+        std::tuple<int, int, std::uint64_t> word_key_{-1, -1, 0}; // selection and content revision they were found for
+        std::pair<int, int> brackets_{-1, -1};                    // the bracket beside the caret and its partner
+        std::pair<int, std::uint64_t> bracket_key_{-1, 0};
+        double bracket_time_ = -1.0; // when brackets_ last changed, for the pulse
         std::string needle_;
         bool needle_case_ = false;
         bool matches_dirty_ = false;
@@ -229,7 +241,8 @@ namespace simple_notepad
         };
         std::vector<minimap_block> minimap_blocks_;
         minimap_key minimap_key_{};
-        std::uint64_t revision_ = 0; // changes with the text, rows or spans
+        std::uint64_t revision_ = 0;         // changes with the text, rows or spans
+        std::uint64_t content_revision_ = 0; // changes with the text or spans, not with layout
         static constexpr float MINIMAP_WIDTH = 110.0f;
         float minimap_width_ = MINIMAP_WIDTH; // unscaled, dragged by its left edge
         bool snap_caret_ = true;
@@ -246,11 +259,26 @@ namespace simple_notepad
         float zoom_scale_ = 1.0f;
         float zoom_x_ = 0.0f; // screen point an eased zoom scales about: the mouse, or else the caret
         float zoom_y_ = 0.0f;
-        float caret_x_ = 0.0f; // animated, content space
+        // one corner of the caret quad, sprung toward its place on its own so the caret stretches as it moves
+        struct caret_corner
+        {
+            float off_x = 0.0f, off_y = 0.0f; // distance still to travel
+            float vel_x = 0.0f, vel_y = 0.0f;
+            float seconds = 0.0f; // how long its spring takes to settle
+        };
+        std::array<caret_corner, 4> caret_corners_{}; // in CARET_CORNERS order
+        float caret_x_ = 0.0f;                        // target, content space
         float caret_y_ = 0.0f;
         bool caret_settled_ = true;
         double caret_moved_ = 0.0;
 
+        static void shift_ranges(std::vector<fade>& ranges, int pos, int remove, int delta);
+        void flash(int start, int end);
+        void find_word_matches(int lo, int hi);
+        [[nodiscard]] std::pair<int, int> match_bracket(int pos) const;
+        [[nodiscard]] bool in_literal(int pos) const; // inside a comment or string
+        void retarget_caret(float dx, float dy);
+        [[nodiscard]] static bool spring(float& offset, float& velocity, float seconds, float dt);
         [[nodiscard]] float advance(unsigned int c, float x) const;
         [[nodiscard]] float measure(int start, int end) const;
         [[nodiscard]] row next_row(int start, int line, bool first, int max_end) const;
