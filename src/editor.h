@@ -35,6 +35,12 @@ namespace simple_notepad
             bool hold_wrap = false;    // keeps the current wrap width, e.g. while the window is dragged to a new size
         };
 
+        struct indent_style
+        {
+            bool tabs;
+            int width; // columns per level
+        };
+
         static constexpr int MAX_MATCHES = 20000; // bounds time and memory for a short needle in a huge file
 
         void draw(const view& v);
@@ -91,6 +97,21 @@ namespace simple_notepad
         {
             return line_count_;
         }
+        // guessed from the text by set_text; the user can override it for this file
+        [[nodiscard]] indent_style indentation() const
+        {
+            return indent_;
+        }
+        void set_indentation(indent_style style)
+        {
+            indent_ = style;
+        }
+        [[nodiscard]] int word_count() const // runs of non-whitespace
+        {
+            return word_count_;
+        }
+        // characters and words in the selection; counts only what its ends moved over since the last call
+        [[nodiscard]] std::pair<int, int> selection_counts();
         // differs after every edit and returns to earlier values on undo, so it can track the saved point
         [[nodiscard]] std::uint64_t state() const;
         [[nodiscard]] bool focused() const
@@ -195,6 +216,17 @@ namespace simple_notepad
             std::vector<row>{{.start = 0, .end = 0, .line = 0, .first = true, .width = 0.0f}}};
         int line_count_ = 1;
         int char_count_ = 0;
+        int word_count_ = 0;
+        indent_style indent_{.tabs = true, .width = 4};
+        // rows holding a match or a same-word match, deduplicated, for the scrollbar ticks
+        std::vector<int> match_rows_;
+        std::vector<int> word_rows_;
+        std::uint64_t marks_revision_ = 0; // changes when either match list is rebuilt
+        std::pair<std::uint64_t, std::uint64_t> mark_rows_key_{~std::uint64_t{0}, 0};
+        // selection_counts() as of this selection and content revision; words cut by the start are added on return
+        std::tuple<int, int, std::uint64_t> counted_key_{0, 0, 0};
+        int counted_chars_ = 0;
+        int counted_words_ = 0;
         // characters from the line start to column_pos_, carried along so a huge line is counted once
         mutable int column_pos_ = -1;
         mutable int column_chars_ = 0;
@@ -307,6 +339,10 @@ namespace simple_notepad
         void redo();
         void move_caret(int pos, bool extend);
         void erase_selection_or(int from, int to, merge kind);
+        void insert_newline();                                 // keeps the line's indentation
+        void indent_lines(bool outdent);                       // every line the selection touches, as one step
+        [[nodiscard]] indent_style detect_indentation() const; // sniffed from the start of the text
+        [[nodiscard]] std::string indent_unit(std::string_view line) const; // the line's own style, else the file's
 
         void handle_keyboard();
         void handle_mouse(float origin_x, float origin_y, bool hovered);

@@ -1151,7 +1151,13 @@ namespace simple_notepad
         }
 
         const std::string position = std::format("Ln {}, Col {}", editor_.line(), editor_.column());
-        const std::string count = std::format("{} characters", editor_.char_count());
+        std::string count = std::format("{} words, {} characters", editor_.word_count(), editor_.char_count());
+        if (const auto [lo, hi] = editor_.selection(); lo != hi)
+        {
+            const auto [selected_chars, selected_words] = editor_.selection_counts();
+            count = std::format("{} of {} words, {} of {} characters", selected_words, editor_.word_count(),
+                                selected_chars, editor_.char_count());
+        }
         // estimated: converting the text every frame is too slow for big files, and utf-16 ignores surrogates
         const auto chars = static_cast<std::uint64_t>(editor_.char_count());
         const auto line_breaks = doc_.crlf ? static_cast<std::uint64_t>(editor_.line_count() - 1) : 0; // each \r
@@ -1174,13 +1180,16 @@ namespace simple_notepad
         const std::string size = size_label(bytes);
         const char* encoding = text_file::encoding_name(doc_.encoding);
         const char* eol = doc_.crlf ? "Windows (CRLF)" : "Unix (LF)";
+        const editor::indent_style indent_style = editor_.indentation();
+        const std::string indent = indent_style.tabs ? "Tabs" : std::format("Spaces: {}", indent_style.width);
         const std::string zoom = std::format("{}%", static_cast<int>(std::round(settings_.zoom * 100)));
 
         const float pad = style.FramePadding.x * 2;
         const float gap = style.ItemSpacing.x * 2;
         const float width = ImGui::CalcTextSize(position.c_str()).x + ImGui::CalcTextSize(count.c_str()).x +
-                            ImGui::CalcTextSize(size.c_str()).x + ImGui::CalcTextSize(encoding).x +
-                            ImGui::CalcTextSize(eol).x + ImGui::CalcTextSize(zoom.c_str()).x + (pad * 3) + (gap * 5);
+                            ImGui::CalcTextSize(size.c_str()).x + ImGui::CalcTextSize(indent.c_str()).x +
+                            ImGui::CalcTextSize(encoding).x + ImGui::CalcTextSize(eol).x +
+                            ImGui::CalcTextSize(zoom.c_str()).x + (pad * 4) + (gap * 6);
         ImGui::SameLine(std::max(ImGui::GetContentRegionMax().x - width, 0.0f));
         ImGui::AlignTextToFramePadding();
         ImGui::TextDisabled("%s", position.c_str());
@@ -1190,6 +1199,11 @@ namespace simple_notepad
         ImGui::TextDisabled("%s", size.c_str());
         ImGui::SameLine(0, gap);
         ImGui::PushStyleColor(ImGuiCol_Text, style.Colors[ImGuiCol_TextDisabled]);
+        if (ImGui::Button(indent.c_str()))
+        {
+            ImGui::OpenPopup("##indent");
+        }
+        ImGui::SameLine(0, gap);
         if (ImGui::Button(encoding))
         {
             ImGui::OpenPopup("##encoding");
@@ -1216,6 +1230,23 @@ namespace simple_notepad
                 {
                     doc_.encoding = e;
                     format_changed_ = true;
+                }
+            }
+            ImGui::EndPopup();
+        }
+        // only for this file while it's open; the next open guesses again
+        if (ImGui::BeginPopup("##indent"))
+        {
+            if (ImGui::Selectable("Tabs", indent_style.tabs))
+            {
+                editor_.set_indentation({.tabs = true, .width = 4});
+            }
+            for (const int width : {2, 4, 8})
+            {
+                if (ImGui::Selectable(std::format("Spaces: {}", width).c_str(),
+                                      !indent_style.tabs && indent_style.width == width))
+                {
+                    editor_.set_indentation({.tabs = false, .width = width});
                 }
             }
             ImGui::EndPopup();

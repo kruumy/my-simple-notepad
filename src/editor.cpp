@@ -42,7 +42,7 @@ namespace simple_notepad
     constexpr double MERGE_SECONDS = 1.0;
     constexpr size_t MAX_UNDO = 1000;
     constexpr double FADE_SECONDS = 0.22;
-    constexpr float FADE_RISE = 4.0f; // new characters float up into place by this many pixels
+    constexpr float POP_FROM = 0.4f; // new characters grow from this size into place
     constexpr size_t MAX_FADE_BYTES = 4096;
     constexpr float PIXEL_SNAP = 0.5f;
     constexpr int MAX_ROW_BYTES = 10000;                      // unwrapped lines break here too, like windows notepad
@@ -61,6 +61,13 @@ namespace simple_notepad
     constexpr int MAX_BRACKET_SCAN = 1024 * 1024; // bytes searched for a partner before giving up
     constexpr double BRACKET_PULSE_SECONDS = 0.45;
     constexpr ImU32 BRACKET_COLOR = IM_COL32(255, 255, 255, 70);
+    constexpr std::string_view OPEN_BRACKETS = "([{";
+    constexpr std::string_view CLOSE_BRACKETS = ")]}";
+    constexpr int INDENT_COLUMNS = 4;           // a tab's width, and the indent level when the text shows none
+    constexpr int MAX_INDENT_SCAN = 256 * 1024; // bytes read to guess the indentation style when text is set
+    constexpr ImU32 GUIDE_COLOR = IM_COL32(255, 255, 255, 22);
+    constexpr int GUIDE_SCAN_ROWS = 64; // how far a blank line looks for the indentation around it
+    constexpr ImU32 WHITESPACE_COLOR = IM_COL32(255, 255, 255, 80);
     constexpr int MAX_HIGHLIGHT_BYTES = 200 * 1024 * 1024; // notepad++'s default large file restriction
     // vs code dark modern, indexed by syntax::token
     constexpr std::array<ImU32, 8> TOKEN_COLORS = {
@@ -94,11 +101,58 @@ namespace simple_notepad
         return static_cast<int>(std::ranges::count_if(s, [](char c) { return (c & 0xC0) != 0x80; }));
     }
 
+    static bool is_blank(char c)
+    {
+        return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+    }
+
+    // words that start in s, given the byte before it
+    static int word_starts(char prev, std::string_view s)
+    {
+        int n = 0;
+        for (const char c : s) // raw loop: each byte is compared with the one before
+        {
+            n += static_cast<int>(is_blank(prev) && !is_blank(c));
+            prev = c;
+        }
+        return n;
+    }
+
+    // the colour and length of "#rgb", "#rgba", "#rrggbb" or "#rrggbbaa" at s[at], if it is one
+    static std::optional<std::pair<ImU32, int>> hex_color(std::string_view s, size_t at)
+    {
+        // not part of a word, nor an html entity like "&#123;"
+        if (at > 0 && (char_class(s[at - 1]) == 1 || s[at - 1] == '&'))
+        {
+            return std::nullopt;
+        }
+        const std::string_view digits = s.substr(at + 1, 8);
+        const size_t n = std::min(digits.size(), digits.find_first_not_of("0123456789abcdefABCDEF"));
+        if ((n != 3 && n != 4 && n != 6 && n != 8) || (at + 1 + n < s.size() && char_class(s[at + 1 + n]) == 1))
+        {
+            return std::nullopt;
+        }
+        const auto digit = [&](size_t i) {
+            const char c = digits[i];
+            return c <= '9' ? c - '0' : (c | 0x20) - 'a' + 10;
+        };
+        const bool short_form = n <= 4;
+        std::array<int, 4> rgba{0, 0, 0, 255};
+        // raw loop: channels and digit pairs share an index
+        for (size_t i = 0; i < (short_form ? n : n / 2); ++i)
+        {
+            rgba[i] = short_form ? digit(i) * 17 : (digit(2 * i) * 16) + digit((2 * i) + 1);
+        }
+        return std::pair{IM_COL32(rgba[0], rgba[1], rgba[2], rgba[3]), static_cast<int>(n + 1)};
+    }
+
     // ---------------------------------------------------------------- public
 
     void editor::set_text(std::string text, const syntax::language* lang, std::vector<syntax::span> spans)
     {
         text_ = gap_buffer<std::string>(std::move(text));
+        word_count_ = word_starts(' ', text_.view(0, text_.size())); // edits keep it up to date from here
+        indent_ = detect_indentation();
         language_ = lang;
         spans_ = syntax::span_buffer(std::move(spans));
         spans_dirty_ = false;
@@ -258,6 +312,34 @@ namespace simple_notepad
         const auto it = std::ranges::lower_bound(matches_, lo, {}, &std::pair<int, int>::first);
         const bool on_match = it != matches_.end() && it->first == lo && it->second == hi;
         return {on_match ? static_cast<int>(it - matches_.begin()) : -1, static_cast<int>(matches_.size())};
+    }
+
+    std::pair<int, int> editor::selection_counts()
+    {
+        const auto [lo, hi] = selection();
+        const auto [old_lo, old_hi, revision] = counted_key_;
+        // signed: negative when b is before a, so moved ends add or remove what they passed over
+        const auto chars = [&](int a, int b) {
+            return a <= b ? utf8_length(text_.view(a, b)) : -utf8_length(text_.view(b, a));
+        };
+        const auto words = [&](int a, int b) {
+            const int from = std::min(a, b);
+            const int n = word_starts(from > 0 ? text_[from - 1] : ' ', text_.view(from, std::max(a, b)));
+            return a <= b ? n : -n;
+        };
+        if (revision != content_revision_ || hi < old_lo || lo > old_hi)
+        {
+            counted_chars_ = chars(lo, hi);
+            counted_words_ = words(lo, hi);
+        }
+        else
+        {
+            counted_chars_ += chars(old_hi, hi) - chars(old_lo, lo);
+            counted_words_ += words(old_hi, hi) - words(old_lo, lo);
+        }
+        counted_key_ = {lo, hi, content_revision_};
+        const bool cut_word = lo < hi && lo > 0 && !is_blank(text_[lo]) && !is_blank(text_[lo - 1]);
+        return {counted_chars_, counted_words_ + static_cast<int>(cut_word)};
     }
 
     std::uint64_t editor::state() const
@@ -446,9 +528,17 @@ namespace simple_notepad
         edited_.old_end = edited_.new_end - (new_size - scanned_size_);
         shift_ranges(fades_, pos, remove, delta);
         shift_ranges(flashes_, pos, remove, delta);
+        const char before = pos > 0 ? text_[pos - 1] : ' ';
+        const char after = std::cmp_less(pos + remove, text_.size()) ? text_[pos + remove] : ' ';
         const std::string_view removed = text_.view(pos, pos + remove);
         edited_.joined = edited_.joined || removed.find('\n') != std::string_view::npos;
         char_count_ += utf8_length(insert) - utf8_length(removed);
+        // the word after the edit may start or stop starting where the edited bytes end
+        const auto starts = [&](std::string_view s) {
+            return word_starts(before, s) +
+                   static_cast<int>(!is_blank(after) && is_blank(s.empty() ? before : s.back()));
+        };
+        word_count_ += starts(insert) - starts(removed);
         // the counted column holds through edits after it and follows ones that end at it on its line
         if (column_pos_ > pos)
         {
@@ -533,6 +623,7 @@ namespace simple_notepad
     void editor::find_matches()
     {
         matches_dirty_ = false;
+        ++marks_revision_;
         matches_.clear();
         matches_capped_ = false;
         // raw loop: search() wraps around, so stop once a hit lands before the cursor
@@ -890,6 +981,139 @@ namespace simple_notepad
         }
     }
 
+    void editor::insert_newline()
+    {
+        const auto [lo, hi] = selection();
+        const int start = line_start(lo);
+        int indent_end = start;
+        while (indent_end < lo && (text_[indent_end] == ' ' || text_[indent_end] == '\t')) // raw loop: byte scan
+        {
+            ++indent_end;
+        }
+        const std::string indent(text_.view(start, indent_end));
+        std::string inserted = "\n" + indent;
+        size_t caret_at = inserted.size();
+        // after an opening bracket the new line goes a level deeper, and a partner right after gets its own line
+        const size_t open = lo > start ? OPEN_BRACKETS.find(text_[lo - 1]) : std::string_view::npos;
+        if (open != std::string_view::npos)
+        {
+            inserted += indent_unit(indent);
+            caret_at = inserted.size();
+            if (std::cmp_less(hi, text_.size()) && text_[hi] == CLOSE_BRACKETS[open])
+            {
+                inserted += "\n" + indent;
+            }
+        }
+        // a line holding only indentation is left empty instead of keeping it as trailing blanks
+        const int pos = indent_end == lo && lo > start && hi == line_end(hi) ? start : lo;
+        const std::uint64_t before = state();
+        apply(pos, hi - pos, std::move(inserted), merge::none);
+        if (state() != before)
+        {
+            caret_ = anchor_ = pos + static_cast<int>(caret_at);
+        }
+    }
+
+    void editor::indent_lines(bool outdent)
+    {
+        const auto [lo, hi] = selection();
+        const int start = line_start(lo);
+        // a selection ending at a line's start leaves that line alone
+        const int end = line_end(hi > lo && line_start(hi) == hi ? hi - 1 : hi);
+        const std::string old(text_.view(start, end));
+        const auto width = static_cast<size_t>(indent_.width);
+        std::string block;
+        block.reserve(old.size());
+        // raw loop: rebuilds the block a line at a time
+        for (size_t i = 0;;)
+        {
+            const size_t nl = std::min(old.find('\n', i), old.size());
+            const std::string_view line = std::string_view(old).substr(i, nl - i);
+            if (outdent)
+            {
+                const size_t blanks = std::min({line.find_first_not_of(' '), line.size(), width});
+                block += line.substr(line.starts_with('\t') ? 1 : blanks);
+            }
+            else
+            {
+                block += line.empty() ? "" : indent_unit(line); // blank lines stay empty
+                block += line;
+            }
+            if (nl == old.size())
+            {
+                break;
+            }
+            block += '\n';
+            i = nl + 1;
+        }
+        if (block == old)
+        {
+            return; // nothing to outdent; an empty undo step would only confuse
+        }
+        const int delta = static_cast<int>(block.size()) - static_cast<int>(old.size());
+        const int block_end = start + static_cast<int>(block.size());
+        const int caret = caret_;
+        const int anchor = anchor_;
+        const std::uint64_t before = state();
+        apply(start, end - start, std::move(block), merge::none);
+        if (state() == before)
+        {
+            return;
+        }
+        // the block was retyped, not typed: it shouldn't pop in
+        std::erase_if(fades_, [&](const fade& f) { return f.start == start; });
+        if (old.find('\n') == std::string::npos)
+        {
+            // one line: the caret and selection stay on their characters
+            caret_ = std::max(start, caret + delta);
+            anchor_ = std::max(start, anchor + delta);
+        }
+        else
+        {
+            anchor_ = caret >= anchor ? start : block_end;
+            caret_ = caret >= anchor ? block_end : start;
+        }
+    }
+
+    editor::indent_style editor::detect_indentation() const
+    {
+        int tab_lines = 0;
+        int space_lines = 0;
+        int narrowest = 0;
+        const int size = std::min(static_cast<int>(text_.size()), MAX_INDENT_SCAN);
+        // raw loop: measures each line's leading blanks, then skips to the next line
+        for (int p = 0; p < size;)
+        {
+            int spaces = 0;
+            while (p + spaces < size && text_[p + spaces] == ' ') // raw loop: byte scan
+            {
+                ++spaces;
+            }
+            if (text_[p] == '\t')
+            {
+                ++tab_lines;
+            }
+            else if (spaces >= 2) // a single space is alignment, like a block comment's " *", not a level
+            {
+                ++space_lines;
+                narrowest = narrowest == 0 ? spaces : std::min(narrowest, spaces);
+            }
+            while (p < size && text_[p] != '\n') // raw loop: byte scan
+            {
+                ++p;
+            }
+            ++p;
+        }
+        const bool tabs = space_lines <= tab_lines;
+        return {.tabs = tabs, .width = tabs ? INDENT_COLUMNS : std::min(narrowest, 8)};
+    }
+
+    std::string editor::indent_unit(std::string_view line) const
+    {
+        const bool tabs = line.starts_with('\t') || (!line.starts_with(' ') && indent_.tabs);
+        return tabs ? "\t" : std::string(static_cast<size_t>(indent_.width), ' ');
+    }
+
     // ---------------------------------------------------------------- input
 
     void editor::handle_keyboard()
@@ -978,15 +1202,38 @@ namespace simple_notepad
         }
         else if (pressed(ImGuiKey_Enter) || pressed(ImGuiKey_KeypadEnter))
         {
-            apply(lo, hi - lo, "\n", merge::none);
+            insert_newline();
         }
         else if (pressed(ImGuiKey_Tab))
         {
-            apply(lo, hi - lo, "\t", merge::typing);
+            if (shift || line_start(lo) != line_start(hi))
+            {
+                indent_lines(shift);
+            }
+            else
+            {
+                // spaces run to the next stop, as a tab would
+                const std::string_view before = text_.view(line_start(lo), lo);
+                std::string unit = indent_unit(before);
+                if (unit != "\t")
+                {
+                    unit.resize(unit.size() - (static_cast<size_t>(utf8_length(before)) % unit.size()));
+                }
+                apply(lo, hi - lo, std::move(unit), merge::typing);
+            }
         }
         else if (pressed(ImGuiKey_Backspace))
         {
-            erase_selection_or(ctrl ? word_edge(caret_, false) : prev_char(caret_), caret_, merge::deleting);
+            int from = ctrl ? word_edge(caret_, false) : prev_char(caret_);
+            // in space indentation it removes a whole level back to the previous stop, as a tab would
+            const int start = line_start(caret_);
+            if (!ctrl && lo == hi && caret_ > start &&
+                std::ranges::all_of(text_.view(start, caret_), [](char c) { return c == ' '; }))
+            {
+                const int width = indent_.width;
+                from = start + ((caret_ - start - 1) / width * width);
+            }
+            erase_selection_or(from, caret_, merge::deleting);
         }
         else if (pressed(ImGuiKey_Delete) && !shift)
         {
@@ -1188,7 +1435,7 @@ namespace simple_notepad
             {
                 ascii_advance_[c] = baked->GetCharAdvance(static_cast<ImWchar>(c));
             }
-            tab_width_ = ascii_advance_[' '] * 4.0f;
+            tab_width_ = ascii_advance_[' '] * static_cast<float>(INDENT_COLUMNS);
             const auto [narrowest, widest] = std::minmax_element(&ascii_advance_[' '], &ascii_advance_['~'] + 1);
             mono_advance_ = *narrowest == *widest ? *narrowest : 0.0f;
             // unwrapped rows break at fixed byte counts and keep font-relative widths, so zoom only rescales
@@ -1395,6 +1642,54 @@ namespace simple_notepad
             text_dl->PopClipRect();
             scale_drawn(text_dl, text_since, zoom_at, window->InnerClipRect.ToVec4());
         }
+        if (window->ScrollbarY)
+        {
+            // matches as ticks on the scrollbar, placed by row like the minimap
+            const ImRect bar = ImGui::GetWindowScrollbarRect(window, ImGuiAxis_Y);
+            const float content_h = content_size().y;
+            const float tick_h = std::max(2.0f, std::round(2.0f * dpi_));
+            // the rows only change with the text, layout or match lists, not every animation frame
+            if (mark_rows_key_ != std::pair{revision_, marks_revision_})
+            {
+                mark_rows_key_ = {revision_, marks_revision_};
+                const auto to_rows = [&](const std::vector<std::pair<int, int>>& ranges, std::vector<int>& rows) {
+                    rows.clear();
+                    std::ranges::for_each(ranges, [&](const std::pair<int, int>& range) {
+                        if (const int r = row_of(range.first); rows.empty() || rows.back() != r)
+                        {
+                            rows.push_back(r);
+                        }
+                    });
+                };
+                to_rows(matches_, match_rows_);
+                to_rows(word_matches_, word_rows_);
+            }
+            const auto ticks = [&](const std::vector<int>& rows, ImU32 col) {
+                float drawn = -1.0f;
+                // raw loop: rows landing on the same pixel row draw once
+                for (const int r : rows)
+                {
+                    const float row_y = (static_cast<float>(r) * line_height_) + pad;
+                    const float y = std::floor(bar.Min.y + (row_y / content_h * bar.GetHeight()));
+                    if (y > drawn)
+                    {
+                        text_dl->AddRectFilled({bar.Min.x + (2.0f * dpi_), y}, {bar.Max.x - (2.0f * dpi_), y + tick_h},
+                                               col);
+                        drawn = y;
+                    }
+                }
+            };
+            text_dl->PushClipRect(bar.Min, bar.Max);
+            if (focused_)
+            {
+                ticks(word_rows_, WORD_MARK_COLOR);
+            }
+            if (show_matches_)
+            {
+                ticks(match_rows_, MATCH_MARK_COLOR);
+            }
+            text_dl->PopClipRect();
+        }
         ImGui::EndChild();
         ImGui::PopStyleVar();
 
@@ -1453,6 +1748,7 @@ namespace simple_notepad
     void editor::find_word_matches(int lo, int hi)
     {
         word_matches_.clear();
+        ++marks_revision_;
         if (lo == hi || hi - lo > MAX_WORD_BYTES || text_.size() > MAX_WORD_SCAN_BYTES || char_class(text_[lo]) != 1 ||
             word_at(lo) != std::pair{lo, hi})
         {
@@ -1491,8 +1787,6 @@ namespace simple_notepad
     // the bracket right of pos, else left of it, and its partner; brackets in comments and strings don't count
     std::pair<int, int> editor::match_bracket(int pos) const
     {
-        static constexpr std::string_view OPEN = "([{";
-        static constexpr std::string_view CLOSE = ")]}";
         const int size = static_cast<int>(text_.size());
         for (const int at : {pos, pos - 1})
         {
@@ -1501,14 +1795,14 @@ namespace simple_notepad
                 continue;
             }
             const char c = text_[at];
-            const size_t open = OPEN.find(c);
-            const size_t close = CLOSE.find(c);
+            const size_t open = OPEN_BRACKETS.find(c);
+            const size_t close = CLOSE_BRACKETS.find(c);
             if (open == std::string_view::npos && close == std::string_view::npos)
             {
                 continue;
             }
             const bool forward = open != std::string_view::npos;
-            const char partner = forward ? CLOSE[open] : OPEN[close];
+            const char partner = forward ? CLOSE_BRACKETS[open] : OPEN_BRACKETS[close];
             const int step = forward ? 1 : -1;
             int depth = 0;
             // raw loop: walks byte by byte from the bracket, counting nesting
@@ -1682,10 +1976,19 @@ namespace simple_notepad
                         cut = std::min(cut, f.start);
                     }
                 }
-                const float e = motion::ease_out(t);
-                dl->AddText({x, y + text_offset + ((1.0f - e) * FADE_RISE * dpi_)},
-                            t >= 1.0f ? col : ImGui::GetColorU32(col, e), s + p, s + cut);
-                x += measure(p, cut);
+                const int first_vertex = dl->VtxBuffer.Size;
+                const float width = measure(p, cut);
+                dl->AddText({x, y + text_offset}, t >= 1.0f ? col : ImGui::GetColorU32(col, motion::ease_out(t)), s + p,
+                            s + cut);
+                if (t < 1.0f)
+                {
+                    // pops in: grows about its centre with a slight overshoot
+                    const float scale = POP_FROM + ((1.0f - POP_FROM) * motion::ease_out_back(t));
+                    const ImVec2 centre{x + (width * 0.5f), y + (lh * 0.5f)};
+                    std::ranges::for_each(std::span(dl->VtxBuffer.Data, dl->VtxBuffer.Size).subspan(first_vertex),
+                                          [&](ImDrawVert& v) { v.pos = centre + ((v.pos - centre) * scale); });
+                }
+                x += width;
                 p = cut;
             }
             return x;
@@ -1723,6 +2026,32 @@ namespace simple_notepad
             return shown ? std::ranges::upper_bound(ranges, rows_[first].start, {}, &std::pair<int, int>::second)
                          : ranges.end();
         };
+        // width of a line's leading whitespace, or -1 when it holds nothing else
+        const auto indent_width = [&](int r) {
+            const row w = rows_[r];
+            float x = 0.0f;
+            int p = w.start;
+            while (p < w.end && (text_[p] == ' ' || text_[p] == '\t')) // raw loop: byte scan
+            {
+                x += advance(static_cast<unsigned char>(text_[p++]), x);
+            }
+            return p < w.end ? x : -1.0f;
+        };
+        // a blank line carries the guides of the shallower of the lines around it
+        const auto blank_indent = [&](int r) {
+            const auto nearest = [&](int step) {
+                // raw loop: walks rows away from r to the first non-blank line
+                for (int k = r + step, n = 0; k >= 0 && k <= last_row && n < GUIDE_SCAN_ROWS; k += step, ++n)
+                {
+                    if (const float x = rows_[k].first ? indent_width(k) : -1.0f; x >= 0.0f)
+                    {
+                        return x;
+                    }
+                }
+                return 0.0f;
+            };
+            return std::min(nearest(-1), nearest(1));
+        };
         auto match = first_range(matches_, show_matches_);
         auto word = first_range(word_matches_, focused_);
         for (int r = first; r <= last; ++r) // raw loop: visible rows by index
@@ -1730,6 +2059,19 @@ namespace simple_notepad
             const row w = rows_[r];
             s = text_.contiguous(w.start, w.end);
             const float y = origin_y + (static_cast<float>(r) * lh);
+            // indent guides, at each tab stop inside the leading whitespace; wrapped rows start at 0 so get none
+            if (w.first)
+            {
+                const float own = indent_width(r);
+                const float indent = own >= 0.0f ? own : blank_indent(r);
+                const float level = static_cast<float>(indent_.width) * ascii_advance_[' '];
+                // raw loop: one guide per indent level
+                for (float gx = 0.0f; gx < indent - PIXEL_SNAP; gx += level)
+                {
+                    const float gx_screen = std::floor(origin_x + gx) + 0.5f;
+                    dl->AddLine({gx_screen, y}, {gx_screen, y + lh}, GUIDE_COLOR, dpi_);
+                }
+            }
             draw_ranges(matches_, match, w, y, MATCH_COLOR);
             draw_ranges(word_matches_, word, w, y, WORD_COLOR);
             for (const fade& f : flashes_)
@@ -1767,6 +2109,48 @@ namespace simple_notepad
                     dl->AddRectFilled({x0, y}, {x1, y + lh}, IM_COL32(255, 255, 255, static_cast<int>(60 * pulse)),
                                       2.0f * dpi_);
                     dl->AddRect({x0, y}, {x1, y + lh}, BRACKET_COLOR, 2.0f * dpi_, 0, 1.0f * dpi_);
+                }
+            }
+            // selected whitespace: dots for spaces, arrows for tabs
+            if (const int a = std::max(lo, w.start), b = std::min(hi, w.end); a < b)
+            {
+                const float mid = y + (lh * 0.5f);
+                float wx = measure(w.start, a);
+                // raw loop: walks the selected part of the row, stopping past the view's right edge
+                for (int p = a; p < b && origin_x + wx <= inner.Max.x;)
+                {
+                    unsigned int c = static_cast<unsigned char>(s[p]);
+                    const int len = c < 128 ? 1 : ImTextCharFromUtf8(&c, s + p, s + w.end);
+                    const float step = advance(c, wx);
+                    const float x0 = origin_x + wx;
+                    if (c == ' ')
+                    {
+                        dl->AddCircleFilled({x0 + (step * 0.5f), mid}, 1.2f * dpi_, WHITESPACE_COLOR, 8);
+                    }
+                    else if (c == '\t')
+                    {
+                        const float x1 = x0 + step - (3.0f * dpi_);
+                        const float head = std::min(3.0f * dpi_, step * 0.25f);
+                        dl->AddLine({x0 + (3.0f * dpi_), mid}, {x1, mid}, WHITESPACE_COLOR, dpi_);
+                        dl->AddLine({x1 - head, mid - head}, {x1, mid}, WHITESPACE_COLOR, dpi_);
+                        dl->AddLine({x1 - head, mid + head}, {x1, mid}, WHITESPACE_COLOR, dpi_);
+                    }
+                    wx += step;
+                    p += len;
+                }
+            }
+            // hex colours get an underline in their colour; the outline keeps dark ones visible
+            const std::string_view line(s + w.start, w.end - w.start);
+            // raw loop: each find starts past the last '#'
+            for (size_t h = line.find('#'); h != std::string_view::npos; h = line.find('#', h + 1))
+            {
+                if (const auto color = hex_color(line, h))
+                {
+                    const int at = w.start + static_cast<int>(h);
+                    const ImVec2 bar_min{origin_x + measure(w.start, at), y + lh - (3.5f * dpi_)};
+                    const ImVec2 bar_max{origin_x + measure(w.start, at + color->second), y + lh - (0.5f * dpi_)};
+                    dl->AddRectFilled(bar_min, bar_max, color->first, dpi_);
+                    dl->AddRect(bar_min, bar_max, IM_COL32(255, 255, 255, 50), dpi_, 0, dpi_);
                 }
             }
             float x = 0.0f;
@@ -1822,7 +2206,9 @@ namespace simple_notepad
         }
         caret_x_ = target_x;
         caret_y_ = target_y;
-        const float dt = std::min(ImGui::GetIO().DeltaTime, 1.0f / 30.0f);
+        // a move from rest holds still this frame: after an idle wait its delta is the whole wait, which would land a
+        // short move in one step
+        const float dt = caret_settled_ ? 0.0f : std::min(ImGui::GetIO().DeltaTime, 1.0f / 30.0f);
         caret_settled_ = true;
         for (caret_corner& c : caret_corners_)
         {

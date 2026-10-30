@@ -18,4 +18,12 @@ namespace simple_notepad::motion
         t = std::clamp(t, 0.0f, 1.0f);
         return 1.0f - ((1.0f - t) * (1.0f - t) * (1.0f - t));
     }
+
+    // overshoots by about 10% before settling at 1
+    [[nodiscard]] inline float ease_out_back(float t)
+    {
+        constexpr float OVERSHOOT = 1.70158f;
+        const float u = std::clamp(t, 0.0f, 1.0f) - 1.0f;
+        return 1.0f + ((OVERSHOOT + 1.0f) * u * u * u) + (OVERSHOOT * u * u);
+    }
 } // namespace simple_notepad::motion
