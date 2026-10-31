@@ -42,7 +42,7 @@ namespace simple_notepad
     constexpr double MERGE_SECONDS = 1.0;
     constexpr size_t MAX_UNDO = 1000;
     constexpr double FADE_SECONDS = 0.22;
-    constexpr float POP_FROM = 0.4f; // new characters grow from this size into place
+    constexpr float FADE_RISE = 4.0f; // new characters float up into place by this many pixels
     constexpr size_t MAX_FADE_BYTES = 4096;
     constexpr float PIXEL_SNAP = 0.5f;
     constexpr int MAX_ROW_BYTES = 10000;                      // unwrapped lines break here too, like windows notepad
@@ -1060,7 +1060,7 @@ namespace simple_notepad
         {
             return;
         }
-        // the block was retyped, not typed: it shouldn't pop in
+        // the block was retyped, not typed: it shouldn't fade in
         std::erase_if(fades_, [&](const fade& f) { return f.start == start; });
         if (old.find('\n') == std::string::npos)
         {
@@ -1294,7 +1294,12 @@ namespace simple_notepad
             const int shift_by = end - start + 1;
             std::string copy(1, '\n');
             copy += text_.view(start, end);
+            const std::uint64_t before = state();
             apply(end, 0, std::move(copy), merge::none);
+            if (state() != before)
+            {
+                flash(end + 1, end + shift_by);
+            }
             caret_ = caret + shift_by;
             anchor_ = anchor + shift_by;
         }
@@ -1976,19 +1981,10 @@ namespace simple_notepad
                         cut = std::min(cut, f.start);
                     }
                 }
-                const int first_vertex = dl->VtxBuffer.Size;
-                const float width = measure(p, cut);
-                dl->AddText({x, y + text_offset}, t >= 1.0f ? col : ImGui::GetColorU32(col, motion::ease_out(t)), s + p,
-                            s + cut);
-                if (t < 1.0f)
-                {
-                    // pops in: grows about its centre with a slight overshoot
-                    const float scale = POP_FROM + ((1.0f - POP_FROM) * motion::ease_out_back(t));
-                    const ImVec2 centre{x + (width * 0.5f), y + (lh * 0.5f)};
-                    std::ranges::for_each(std::span(dl->VtxBuffer.Data, dl->VtxBuffer.Size).subspan(first_vertex),
-                                          [&](ImDrawVert& v) { v.pos = centre + ((v.pos - centre) * scale); });
-                }
-                x += width;
+                const float e = motion::ease_out(t);
+                dl->AddText({x, y + text_offset + ((1.0f - e) * FADE_RISE * dpi_)},
+                            t >= 1.0f ? col : ImGui::GetColorU32(col, e), s + p, s + cut);
+                x += measure(p, cut);
                 p = cut;
             }
             return x;
@@ -2192,7 +2188,9 @@ namespace simple_notepad
         // smooth caret: its corners spring toward the target, then it blinks once settled
         const float target_x = x_of(caret_);
         const float target_y = static_cast<float>(caret_row) * lh;
-        if (snap_caret_)
+        // gliding in from a line scrolled out of view would sweep across the page
+        const bool was_shown = origin_y + caret_y_ + lh > inner.Min.y && origin_y + caret_y_ < inner.Max.y;
+        if (snap_caret_ || (!was_shown && (target_x != caret_x_ || target_y != caret_y_)))
         {
             for (caret_corner& c : caret_corners_)
             {
